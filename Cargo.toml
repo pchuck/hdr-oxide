@@ -1,0 +1,40 @@
+[package]
+name = "hdr-oxide"
+version = "0.1.0"
+edition = "2021"
+authors = ["HDR-Oxide Team"]
+description = "CLI tool for creating HDR images from multiple exposures"
+license = "MIT"
+repository = "https://github.com/pcharles/hdr-oxide"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+image = "0.25"
+image-hdr = "0.6"
+exr = "1.7"
+rayon = "1.10"
+kamadak-exif = "0.5"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+indicatif = "0.17"
+rfd = "0.15"
+eframe = "0.29"
+opencv = { version = "0.98", features = ["stitching"], optional = true }
+glob = "0.3"
+
+[features]
+default = []
+alignment = ["opencv"]
+
+[[bin]]
+name = "hdr-oxide"
+path = "src/main.rs"
+
+[lib]
+name = "hdr_oxide"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
