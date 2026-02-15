@@ -3,7 +3,7 @@ use image::DynamicImage;
 use std::path::PathBuf;
 
 #[cfg(feature = "alignment")]
-pub fn align_images(images: &mut Vec<(PathBuf, DynamicImage)>) -> Result<DynamicImage, HdrError> {
+pub fn align_images(images: &mut Vec<(PathBuf, DynamicImage)>) -> Result<(), HdrError> {
     if images.len() < 2 {
         return Err(HdrError::Alignment(
             "Need at least 2 images for alignment".to_string(),
@@ -16,9 +16,13 @@ pub fn align_images(images: &mut Vec<(PathBuf, DynamicImage)>) -> Result<Dynamic
     );
 
     match align_with_orb(images) {
-        Ok(aligned) => {
+        Ok(aligned_imgs) => {
             log::info!("Alignment complete");
-            Ok(aligned)
+            // Update the input vector with aligned images
+            for (i, aligned_img) in aligned_imgs.into_iter().enumerate() {
+                images[i].1 = aligned_img;
+            }
+            Ok(())
         }
         Err(e) => {
             log::warn!("Alignment failed: {}", e);
@@ -31,7 +35,9 @@ pub fn align_images(images: &mut Vec<(PathBuf, DynamicImage)>) -> Result<Dynamic
 }
 
 #[cfg(feature = "alignment")]
-fn align_with_orb(images: &mut Vec<(PathBuf, DynamicImage)>) -> Result<DynamicImage, HdrError> {
+fn align_with_orb(
+    images: &mut Vec<(PathBuf, DynamicImage)>,
+) -> Result<Vec<DynamicImage>, HdrError> {
     use opencv::calib3d::{find_homography, RANSAC};
     use opencv::core::{BorderTypes, DMatch, Mat, Point2f, Scalar, Size, Vector, NORM_HAMMING};
     use opencv::features2d::{BFMatcher, ORB_ScoreType, ORB};
@@ -163,7 +169,7 @@ fn align_with_orb(images: &mut Vec<(PathBuf, DynamicImage)>) -> Result<DynamicIm
         aligned_imgs.push(DynamicImage::ImageRgb8(result));
     }
 
-    Ok(aligned_imgs[0].clone())
+    Ok(aligned_imgs)
 }
 
 #[cfg(feature = "alignment")]
@@ -206,7 +212,7 @@ fn create_mat_from_rgb8(img: &image::RgbImage) -> opencv::core::Mat {
 }
 
 #[cfg(not(feature = "alignment"))]
-pub fn align_images(_images: &mut Vec<(PathBuf, DynamicImage)>) -> Result<DynamicImage, HdrError> {
+pub fn align_images(_images: &mut Vec<(PathBuf, DynamicImage)>) -> Result<(), HdrError> {
     Err(HdrError::Alignment("Image alignment requires 'alignment' feature. Build with: cargo build --features alignment".to_string()))
 }
 

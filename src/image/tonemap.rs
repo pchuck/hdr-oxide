@@ -1,6 +1,7 @@
 use crate::error::HdrError;
 use crate::image::merge::HdrImage;
 use image::{DynamicImage, ImageBuffer, Rgb};
+use rayon::prelude::*;
 
 pub struct TonemapSettings {
     pub exposure: f32,
@@ -59,15 +60,23 @@ pub fn tonemap_hdr(
 }
 
 fn tonemap_reinhard(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
-    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
-
     let (_avg_lum, max_lum) = calculate_luminance_stats(hdr);
     let white = max_lum.powi(2);
 
-    for y in 0..hdr.height {
-        for x in 0..hdr.width {
-            let pixel = hdr.data.get_pixel(x, y);
+    // Collect all pixels for parallel processing
+    let pixels: Vec<(u32, u32, [f32; 4])> = (0..hdr.height)
+        .flat_map(|y| {
+            (0..hdr.width).map(move |x| {
+                let pixel = hdr.data.get_pixel(x, y);
+                (x, y, [pixel[0], pixel[1], pixel[2], pixel[3]])
+            })
+        })
+        .collect();
 
+    // Process pixels in parallel
+    let processed: Vec<(u32, u32, Rgb<u8>)> = pixels
+        .par_iter()
+        .map(|(x, y, pixel)| {
             let mut r = pixel[0] * settings.exposure;
             let mut g = pixel[1] * settings.exposure;
             let mut b = pixel[2] * settings.exposure;
@@ -107,28 +116,39 @@ fn tonemap_reinhard(hdr: &HdrImage, settings: &TonemapSettings) -> Result<Dynami
             g = srgb_to_gamma(g);
             b = srgb_to_gamma(b);
 
-            output.put_pixel(
-                x,
-                y,
-                Rgb([
-                    (r.clamp(0.0, 1.0) * 255.0) as u8,
-                    (g.clamp(0.0, 1.0) * 255.0) as u8,
-                    (b.clamp(0.0, 1.0) * 255.0) as u8,
-                ]),
-            );
-        }
+            let rgb = Rgb([
+                (r.clamp(0.0, 1.0) * 255.0) as u8,
+                (g.clamp(0.0, 1.0) * 255.0) as u8,
+                (b.clamp(0.0, 1.0) * 255.0) as u8,
+            ]);
+            (*x, *y, rgb)
+        })
+        .collect();
+
+    // Write results back
+    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
+    for (x, y, rgb) in processed {
+        output.put_pixel(x, y, rgb);
     }
 
     Ok(DynamicImage::ImageRgb8(output))
 }
 
 fn tonemap_filmic(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
-    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
+    // Collect all pixels for parallel processing
+    let pixels: Vec<(u32, u32, [f32; 4])> = (0..hdr.height)
+        .flat_map(|y| {
+            (0..hdr.width).map(move |x| {
+                let pixel = hdr.data.get_pixel(x, y);
+                (x, y, [pixel[0], pixel[1], pixel[2], pixel[3]])
+            })
+        })
+        .collect();
 
-    for y in 0..hdr.height {
-        for x in 0..hdr.width {
-            let pixel = hdr.data.get_pixel(x, y);
-
+    // Process pixels in parallel
+    let processed: Vec<(u32, u32, Rgb<u8>)> = pixels
+        .par_iter()
+        .map(|(x, y, pixel)| {
             let mut r = pixel[0] * settings.exposure;
             let mut g = pixel[1] * settings.exposure;
             let mut b = pixel[2] * settings.exposure;
@@ -158,16 +178,19 @@ fn tonemap_filmic(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicI
             g = srgb_to_gamma(g);
             b = srgb_to_gamma(b);
 
-            output.put_pixel(
-                x,
-                y,
-                Rgb([
-                    (r.clamp(0.0, 1.0) * 255.0) as u8,
-                    (g.clamp(0.0, 1.0) * 255.0) as u8,
-                    (b.clamp(0.0, 1.0) * 255.0) as u8,
-                ]),
-            );
-        }
+            let rgb = Rgb([
+                (r.clamp(0.0, 1.0) * 255.0) as u8,
+                (g.clamp(0.0, 1.0) * 255.0) as u8,
+                (b.clamp(0.0, 1.0) * 255.0) as u8,
+            ]);
+            (*x, *y, rgb)
+        })
+        .collect();
+
+    // Write results back
+    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
+    for (x, y, rgb) in processed {
+        output.put_pixel(x, y, rgb);
     }
 
     Ok(DynamicImage::ImageRgb8(output))
@@ -186,12 +209,21 @@ fn apply_filmic_curve(x: f32) -> f32 {
 
 fn tonemap_gamma(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
     let gamma = 1.0 / 2.2;
-    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
 
-    for y in 0..hdr.height {
-        for x in 0..hdr.width {
-            let pixel = hdr.data.get_pixel(x, y);
+    // Collect all pixels for parallel processing
+    let pixels: Vec<(u32, u32, [f32; 4])> = (0..hdr.height)
+        .flat_map(|y| {
+            (0..hdr.width).map(move |x| {
+                let pixel = hdr.data.get_pixel(x, y);
+                (x, y, [pixel[0], pixel[1], pixel[2], pixel[3]])
+            })
+        })
+        .collect();
 
+    // Process pixels in parallel
+    let processed: Vec<(u32, u32, Rgb<u8>)> = pixels
+        .par_iter()
+        .map(|(x, y, pixel)| {
             let mut r = pixel[0] * settings.exposure;
             let mut g = pixel[1] * settings.exposure;
             let mut b = pixel[2] * settings.exposure;
@@ -213,16 +245,19 @@ fn tonemap_gamma(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicIm
             // Apply saturation and vibrance
             (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
 
-            output.put_pixel(
-                x,
-                y,
-                Rgb([
-                    (r.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
-                    (g.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
-                    (b.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
-                ]),
-            );
-        }
+            let rgb = Rgb([
+                (r.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
+                (g.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
+                (b.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
+            ]);
+            (*x, *y, rgb)
+        })
+        .collect();
+
+    // Write results back
+    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
+    for (x, y, rgb) in processed {
+        output.put_pixel(x, y, rgb);
     }
 
     Ok(DynamicImage::ImageRgb8(output))
@@ -378,7 +413,7 @@ fn apply_sharpen_blur(image: &DynamicImage, amount: f32) -> Result<DynamicImage,
             0.0,
         ];
         let sharpened = image.clone();
-        filter3x3(&mut sharpened.to_rgb8(), &sharpen_kernel);
+        filter3x3(&sharpened.to_rgb8(), &sharpen_kernel);
         Ok(DynamicImage::ImageRgb8(sharpened.to_rgb8()))
     } else if amount < 0.0 {
         // Blur: Gaussian blur with strength based on amount

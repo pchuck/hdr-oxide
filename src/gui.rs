@@ -46,6 +46,9 @@ pub struct HdrApp {
     is_processing: bool,
     rx: Option<mpsc::Receiver<GuiCommand>>,
     path_input: String,
+    // About dialog
+    show_about: bool,
+    about_texture: Option<egui::TextureHandle>,
 }
 
 impl Default for HdrApp {
@@ -71,6 +74,8 @@ impl Default for HdrApp {
             is_processing: false,
             rx: None,
             path_input: String::new(),
+            show_about: false,
+            about_texture: None,
         }
     }
 }
@@ -87,21 +92,19 @@ impl HdrApp {
                     let valid_exts = ["jpg", "jpeg", "png", "tif", "tiff"];
                     let mut added = 0;
 
-                    for entry in paths {
-                        if let Ok(path) = entry {
-                            if path.is_file() {
-                                let ext = path
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .unwrap_or("")
-                                    .to_lowercase();
-                                if valid_exts.contains(&ext.as_str())
-                                    && !self.input_paths.contains(&path)
-                                {
-                                    self.input_paths.push(path.clone());
-                                    self.pending_thumbnail_paths.push(path);
-                                    added += 1;
-                                }
+                    for path in paths.flatten() {
+                        if path.is_file() {
+                            let ext = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_lowercase();
+                            if valid_exts.contains(&ext.as_str())
+                                && !self.input_paths.contains(&path)
+                            {
+                                self.input_paths.push(path.clone());
+                                self.pending_thumbnail_paths.push(path);
+                                added += 1;
                             }
                         }
                     }
@@ -535,97 +538,100 @@ impl eframe::App for HdrApp {
 
         egui::SidePanel::left("left_panel").show(ctx, |ui| {
             ui.heading("HDR-Oxide");
-            ui.label("CLI: hdr-oxide create -i <files> -o output.png");
 
             ui.separator();
 
-            ui.label("Add images:");
-            if ui.button("Open Files...").clicked() && !self.is_processing {
-                self.open_file_dialog();
-            }
+            ui.collapsing("Source Images", |ui| {
+                ui.label("Add images:");
+                if ui.button("Open Files...").clicked() && !self.is_processing {
+                    self.open_file_dialog();
+                }
 
-            ui.separator();
-
-            ui.label("Or type a path (supports wildcards like input/*.jpeg):");
-            ui.text_edit_singleline(&mut self.path_input);
-            if ui.button("Add File(s)").clicked() {
-                self.add_path();
-            }
-
-            if !self.input_paths.is_empty() {
                 ui.separator();
-                ui.label(format!("{} images:", self.input_paths.len()));
 
-                // Display thumbnails vertically, full width
-                let panel_width = ui.available_width();
-                let to_remove = egui::ScrollArea::vertical()
-                    .max_height(300.0)
-                    .show(ui, |ui| {
-                        let mut remove_idx = None;
-                        let spacing = 4.0;
+                ui.label("Or type a path (supports wildcards):");
+                ui.text_edit_singleline(&mut self.path_input);
+                if ui.button("Add File(s)").clicked() {
+                    self.add_path();
+                }
 
-                        for (i, path) in self.input_paths.iter().enumerate() {
-                            ui.vertical(|ui| {
-                                ui.set_width(panel_width);
+                if !self.input_paths.is_empty() {
+                    ui.separator();
+                    ui.label(format!("{} images:", self.input_paths.len()));
 
-                                // Thumbnail image - full panel width
-                                if let Some(thumb) =
-                                    self.thumbnails.iter().find(|t| t.path == *path)
-                                {
-                                    let size = thumb.texture.size();
-                                    let aspect = size[1] as f32 / size[0] as f32;
-                                    let height = (panel_width - spacing * 2.0) * aspect;
-                                    let max_height = 120.0f32; // Cap height for very wide images
-                                    let final_height = height.min(max_height);
+                    // Display thumbnails vertically, full width
+                    let panel_width = ui.available_width();
+                    let to_remove = egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            let mut remove_idx = None;
+                            let spacing = 4.0;
 
-                                    ui.add(egui::Image::new(&thumb.texture).fit_to_exact_size(
-                                        egui::vec2(panel_width - spacing * 2.0, final_height),
-                                    ));
-                                } else {
-                                    ui.add_sized(
-                                        egui::vec2(panel_width - spacing * 2.0, 80.0),
-                                        egui::Spinner::new().size(24.0),
-                                    );
-                                }
+                            for (i, path) in self.input_paths.iter().enumerate() {
+                                ui.vertical(|ui| {
+                                    ui.set_width(panel_width);
 
-                                // Filename and remove button in one row
-                                ui.horizontal(|ui| {
-                                    ui.set_width(panel_width - spacing * 2.0);
-                                    let filename = path
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .chars()
-                                        .take(25)
-                                        .collect::<String>();
-                                    ui.label(egui::RichText::new(filename).size(11.0).monospace());
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui.button("×").clicked() {
-                                                remove_idx = Some(i);
-                                            }
-                                        },
-                                    );
+                                    // Thumbnail image - full panel width
+                                    if let Some(thumb) =
+                                        self.thumbnails.iter().find(|t| t.path == *path)
+                                    {
+                                        let size = thumb.texture.size();
+                                        let aspect = size[1] as f32 / size[0] as f32;
+                                        let height = (panel_width - spacing * 2.0) * aspect;
+                                        let max_height = 120.0f32; // Cap height for very wide images
+                                        let final_height = height.min(max_height);
+
+                                        ui.add(egui::Image::new(&thumb.texture).fit_to_exact_size(
+                                            egui::vec2(panel_width - spacing * 2.0, final_height),
+                                        ));
+                                    } else {
+                                        ui.add_sized(
+                                            egui::vec2(panel_width - spacing * 2.0, 80.0),
+                                            egui::Spinner::new().size(24.0),
+                                        );
+                                    }
+
+                                    // Filename and remove button in one row
+                                    ui.horizontal(|ui| {
+                                        ui.set_width(panel_width - spacing * 2.0);
+                                        let filename = path
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .chars()
+                                            .take(25)
+                                            .collect::<String>();
+                                        ui.label(
+                                            egui::RichText::new(filename).size(11.0).monospace(),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("×").clicked() {
+                                                    remove_idx = Some(i);
+                                                }
+                                            },
+                                        );
+                                    });
+
+                                    ui.add_space(spacing);
                                 });
+                            }
+                            remove_idx
+                        });
 
-                                ui.add_space(spacing);
-                            });
-                        }
-                        remove_idx
-                    });
+                    if let Some(idx) = to_remove.inner {
+                        let path = self.input_paths.remove(idx);
+                        self.remove_thumbnail(&path);
+                        self.hdr_image = None;
+                        self.preview_texture = None;
+                    }
 
-                if let Some(idx) = to_remove.inner {
-                    let path = self.input_paths.remove(idx);
-                    self.remove_thumbnail(&path);
-                    self.hdr_image = None;
-                    self.preview_texture = None;
+                    if ui.button("Clear All").clicked() {
+                        self.clear_images();
+                    }
                 }
-
-                if ui.button("Clear All").clicked() {
-                    self.clear_images();
-                }
-            }
+            });
 
             ui.separator();
 
@@ -665,10 +671,11 @@ impl eframe::App for HdrApp {
 
             ui.separator();
 
-            if self.hdr_image.is_some() && !self.is_processing {
-                if ui.button("Update Preview").clicked() {
-                    self.update_preview(ctx);
-                }
+            if self.hdr_image.is_some()
+                && !self.is_processing
+                && ui.button("Update Preview").clicked()
+            {
+                self.update_preview(ctx);
             }
 
             if ui.button("Create HDR").clicked()
@@ -684,11 +691,68 @@ impl eframe::App for HdrApp {
 
             ui.separator();
 
+            if ui.button("About").clicked() {
+                self.show_about = true;
+                // Load about image if not already loaded
+                if self.about_texture.is_none() {
+                    if let Some(img) = load_about_image() {
+                        let (width, height) = img.dimensions();
+                        let rgba = img.to_rgba8();
+                        let pixels: Vec<egui::Color32> = rgba
+                            .pixels()
+                            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+                            .collect();
+                        let color_image = egui::ColorImage {
+                            size: [width as usize, height as usize],
+                            pixels,
+                        };
+                        self.about_texture = Some(ctx.load_texture(
+                            "about_image",
+                            Arc::new(color_image),
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                }
+            }
+
+            ui.separator();
+
             if self.is_processing {
                 ui.add(egui::Spinner::new());
             }
             ui.label(&self.status);
         });
+
+        // About dialog window
+        if self.show_about {
+            egui::Window::new("About HDR Oxide")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        // Show sample image if loaded
+                        if let Some(ref texture) = self.about_texture {
+                            let size = texture.size();
+                            let max_width = 400.0;
+                            let scale = (max_width / size[0] as f32).min(1.0);
+                            let display_size =
+                                egui::vec2(size[0] as f32 * scale, size[1] as f32 * scale);
+                            ui.add(egui::Image::new(texture).max_size(display_size));
+                            ui.add_space(10.0);
+                        }
+
+                        ui.heading("HDR Oxide");
+                        ui.label("Copyright © 2026 ultrametrics");
+                        ui.add_space(10.0);
+                        ui.label("CLI: hdr-oxide create --help");
+                        ui.add_space(10.0);
+
+                        if ui.button("Close").clicked() {
+                            self.show_about = false;
+                        }
+                    });
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Preview");
@@ -726,6 +790,17 @@ fn load_thumbnail(path: &PathBuf) -> Option<image::RgbaImage> {
         }
         Err(e) => {
             log::error!("Failed to load image {:?}: {}", path, e);
+            None
+        }
+    }
+}
+
+fn load_about_image() -> Option<image::DynamicImage> {
+    let about_path = std::path::PathBuf::from("resources/sample.png");
+    match image::open(&about_path) {
+        Ok(img) => Some(img),
+        Err(e) => {
+            log::warn!("Could not load about image from {:?}: {}", about_path, e);
             None
         }
     }

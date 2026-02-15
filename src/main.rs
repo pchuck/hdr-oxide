@@ -1,6 +1,6 @@
 use clap::Parser;
 use hdr_oxide::cli::{Cli, Commands};
-use hdr_oxide::commands::commands::{create_hdr, info_hdr};
+use hdr_oxide::commands::{create_hdr, info_hdr};
 use hdr_oxide::gui;
 
 fn main() {
