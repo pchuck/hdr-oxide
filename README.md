@@ -1,6 +1,8 @@
 # HDR-Oxide
 
-A GUI and CLI application for creating HDR (High Dynamic Range) images from multiple exposure photographs.
+A GUI and CLI application for creating HDR (High Dynamic Range) images from multiple exposure photographs built with Rust, eframe/egui and rayon for parallel rendering.
+
+![HDR Oxide Screenshot](resources/sample.png)
 
 ## Features
 
