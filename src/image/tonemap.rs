@@ -1,7 +1,17 @@
 use crate::error::HdrError;
 use crate::image::merge::HdrImage;
-use image::{DynamicImage, ImageBuffer, Rgb};
+use image::{DynamicImage, ImageBuffer, Rgb, Rgba32FImage};
 use rayon::prelude::*;
+use std::sync::Arc;
+
+const LUMINANCE_R: f32 = 0.2126;
+const LUMINANCE_G: f32 = 0.7152;
+const LUMINANCE_B: f32 = 0.0722;
+const SRGB_THRESHOLD: f32 = 0.0031308;
+const SRGB_LINEAR_FACTOR: f32 = 12.92;
+const SRGB_GAMMA_FACTOR: f32 = 1.055;
+const SRGB_GAMMA_EXPONENT: f32 = 1.0 / 2.4;
+const SRGB_GAMMA_OFFSET: f32 = 0.055;
 
 pub struct TonemapSettings {
     pub exposure: f32,
@@ -33,6 +43,186 @@ impl Default for TonemapSettings {
     }
 }
 
+pub fn tonemap_hdr_arc(
+    hdr: Arc<HdrImage>,
+    method: &str,
+    settings: &TonemapSettings,
+) -> Result<DynamicImage, HdrError> {
+    log::info!("Tonemapping HDR using {} method", method);
+
+    let mut result = match method.to_lowercase().as_str() {
+        "reinhard" => tonemap_reinhard_arc(&hdr, settings),
+        "filmic" => tonemap_filmic_arc(&hdr, settings),
+        "gamma" => tonemap_gamma_arc(&hdr, settings),
+        _ => {
+            log::warn!("Unknown tonemap method '{}', using Reinhard", method);
+            tonemap_reinhard_arc(&hdr, settings)
+        }
+    }?;
+
+    if settings.sharpen.abs() > 0.01 {
+        result = apply_sharpen_blur(&result, settings.sharpen)?;
+    }
+
+    log::info!("Tonemapping complete");
+    Ok(result)
+}
+
+fn tonemap_reinhard_arc(
+    hdr: &Arc<HdrImage>,
+    settings: &TonemapSettings,
+) -> Result<DynamicImage, HdrError> {
+    let data = hdr.data.as_ref();
+    let max_lum = calculate_luminance_stats_arc(data, hdr.width, hdr.height).1;
+    let white = max_lum.powi(2);
+
+    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+        .into_par_iter()
+        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let pixel = data.get_pixel(x, y);
+            let mut r = pixel[0] * settings.exposure;
+            let mut g = pixel[1] * settings.exposure;
+            let mut b = pixel[2] * settings.exposure;
+
+            (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
+
+            let lum = LUMINANCE_R * r + LUMINANCE_G * g + LUMINANCE_B * b;
+            let lum_scaled = lum * (1.0 + lum / white) / (1.0 + lum);
+
+            if lum > 0.0 {
+                let scale = lum_scaled / lum;
+                r *= scale;
+                g *= scale;
+                b *= scale;
+            }
+
+            r = r / (r + 1.0);
+            g = g / (g + 1.0);
+            b = b / (b + 1.0);
+
+            r = apply_contrast(r, settings.contrast);
+            g = apply_contrast(g, settings.contrast);
+            b = apply_contrast(b, settings.contrast);
+
+            (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
+            (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
+            (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
+
+            r = srgb_to_gamma(r);
+            g = srgb_to_gamma(g);
+            b = srgb_to_gamma(b);
+
+            let rgb = Rgb([
+                (r.clamp(0.0, 1.0) * 255.0) as u8,
+                (g.clamp(0.0, 1.0) * 255.0) as u8,
+                (b.clamp(0.0, 1.0) * 255.0) as u8,
+            ]);
+            (x, y, rgb)
+        })
+        .collect();
+
+    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
+    for (x, y, rgb) in processed {
+        output.put_pixel(x, y, rgb);
+    }
+
+    Ok(DynamicImage::ImageRgb8(output))
+}
+
+fn tonemap_filmic_arc(
+    hdr: &Arc<HdrImage>,
+    settings: &TonemapSettings,
+) -> Result<DynamicImage, HdrError> {
+    let data = hdr.data.as_ref();
+
+    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+        .into_par_iter()
+        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let pixel = data.get_pixel(x, y);
+            let mut r = pixel[0] * settings.exposure;
+            let mut g = pixel[1] * settings.exposure;
+            let mut b = pixel[2] * settings.exposure;
+
+            (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
+
+            r = apply_filmic_curve(r);
+            g = apply_filmic_curve(g);
+            b = apply_filmic_curve(b);
+
+            r = apply_contrast(r, settings.contrast);
+            g = apply_contrast(g, settings.contrast);
+            b = apply_contrast(b, settings.contrast);
+
+            (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
+            (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
+            (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
+
+            r = srgb_to_gamma(r);
+            g = srgb_to_gamma(g);
+            b = srgb_to_gamma(b);
+
+            let rgb = Rgb([
+                (r.clamp(0.0, 1.0) * 255.0) as u8,
+                (g.clamp(0.0, 1.0) * 255.0) as u8,
+                (b.clamp(0.0, 1.0) * 255.0) as u8,
+            ]);
+            (x, y, rgb)
+        })
+        .collect();
+
+    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
+    for (x, y, rgb) in processed {
+        output.put_pixel(x, y, rgb);
+    }
+
+    Ok(DynamicImage::ImageRgb8(output))
+}
+
+fn tonemap_gamma_arc(
+    hdr: &Arc<HdrImage>,
+    settings: &TonemapSettings,
+) -> Result<DynamicImage, HdrError> {
+    let data = hdr.data.as_ref();
+    let gamma = 1.0 / 2.2;
+
+    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+        .into_par_iter()
+        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let pixel = data.get_pixel(x, y);
+            let mut r = pixel[0] * settings.exposure;
+            let mut g = pixel[1] * settings.exposure;
+            let mut b = pixel[2] * settings.exposure;
+
+            (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
+
+            r = apply_contrast(r, settings.contrast);
+            g = apply_contrast(g, settings.contrast);
+            b = apply_contrast(b, settings.contrast);
+
+            (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
+            (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
+            (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
+
+            let rgb = Rgb([
+                (r.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
+                (g.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
+                (b.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
+            ]);
+            (x, y, rgb)
+        })
+        .collect();
+
+    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
+    for (x, y, rgb) in processed {
+        output.put_pixel(x, y, rgb);
+    }
+
+    Ok(DynamicImage::ImageRgb8(output))
+}
+
 pub fn tonemap_hdr(
     hdr: &HdrImage,
     method: &str,
@@ -60,31 +250,21 @@ pub fn tonemap_hdr(
 }
 
 fn tonemap_reinhard(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
-    let (_avg_lum, max_lum) = calculate_luminance_stats(hdr);
+    let max_lum = calculate_luminance_stats(hdr).1;
     let white = max_lum.powi(2);
 
-    // Collect all pixels for parallel processing
-    let pixels: Vec<(u32, u32, [f32; 4])> = (0..hdr.height)
-        .flat_map(|y| {
-            (0..hdr.width).map(move |x| {
-                let pixel = hdr.data.get_pixel(x, y);
-                (x, y, [pixel[0], pixel[1], pixel[2], pixel[3]])
-            })
-        })
-        .collect();
-
-    // Process pixels in parallel
-    let processed: Vec<(u32, u32, Rgb<u8>)> = pixels
-        .par_iter()
-        .map(|(x, y, pixel)| {
+    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+        .into_par_iter()
+        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let pixel = hdr.data.get_pixel(x, y);
             let mut r = pixel[0] * settings.exposure;
             let mut g = pixel[1] * settings.exposure;
             let mut b = pixel[2] * settings.exposure;
 
-            // Apply temperature and tint (white balance)
             (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
 
-            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let lum = LUMINANCE_R * r + LUMINANCE_G * g + LUMINANCE_B * b;
             let lum_scaled = lum * (1.0 + lum / white) / (1.0 + lum);
 
             if lum > 0.0 {
@@ -98,18 +278,12 @@ fn tonemap_reinhard(hdr: &HdrImage, settings: &TonemapSettings) -> Result<Dynami
             g = g / (g + 1.0);
             b = b / (b + 1.0);
 
-            // Apply contrast
             r = apply_contrast(r, settings.contrast);
             g = apply_contrast(g, settings.contrast);
             b = apply_contrast(b, settings.contrast);
 
-            // Apply shadows/highlights
             (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-
-            // Apply hue shift
             (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-
-            // Apply saturation and vibrance
             (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
 
             r = srgb_to_gamma(r);
@@ -121,11 +295,10 @@ fn tonemap_reinhard(hdr: &HdrImage, settings: &TonemapSettings) -> Result<Dynami
                 (g.clamp(0.0, 1.0) * 255.0) as u8,
                 (b.clamp(0.0, 1.0) * 255.0) as u8,
             ]);
-            (*x, *y, rgb)
+            (x, y, rgb)
         })
         .collect();
 
-    // Write results back
     let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
     for (x, y, rgb) in processed {
         output.put_pixel(x, y, rgb);
@@ -135,43 +308,27 @@ fn tonemap_reinhard(hdr: &HdrImage, settings: &TonemapSettings) -> Result<Dynami
 }
 
 fn tonemap_filmic(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
-    // Collect all pixels for parallel processing
-    let pixels: Vec<(u32, u32, [f32; 4])> = (0..hdr.height)
-        .flat_map(|y| {
-            (0..hdr.width).map(move |x| {
-                let pixel = hdr.data.get_pixel(x, y);
-                (x, y, [pixel[0], pixel[1], pixel[2], pixel[3]])
-            })
-        })
-        .collect();
-
-    // Process pixels in parallel
-    let processed: Vec<(u32, u32, Rgb<u8>)> = pixels
-        .par_iter()
-        .map(|(x, y, pixel)| {
+    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+        .into_par_iter()
+        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let pixel = hdr.data.get_pixel(x, y);
             let mut r = pixel[0] * settings.exposure;
             let mut g = pixel[1] * settings.exposure;
             let mut b = pixel[2] * settings.exposure;
 
-            // Apply temperature and tint
             (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
 
             r = apply_filmic_curve(r);
             g = apply_filmic_curve(g);
             b = apply_filmic_curve(b);
 
-            // Apply contrast
             r = apply_contrast(r, settings.contrast);
             g = apply_contrast(g, settings.contrast);
             b = apply_contrast(b, settings.contrast);
 
-            // Apply shadows/highlights
             (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-
-            // Apply hue shift
             (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-
-            // Apply saturation and vibrance
             (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
 
             r = srgb_to_gamma(r);
@@ -183,11 +340,10 @@ fn tonemap_filmic(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicI
                 (g.clamp(0.0, 1.0) * 255.0) as u8,
                 (b.clamp(0.0, 1.0) * 255.0) as u8,
             ]);
-            (*x, *y, rgb)
+            (x, y, rgb)
         })
         .collect();
 
-    // Write results back
     let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
     for (x, y, rgb) in processed {
         output.put_pixel(x, y, rgb);
@@ -196,53 +352,48 @@ fn tonemap_filmic(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicI
     Ok(DynamicImage::ImageRgb8(output))
 }
 
-fn apply_filmic_curve(x: f32) -> f32 {
-    let a = 0.15;
-    let b = 0.50;
-    let c = 0.10;
-    let d = 0.20;
-    let e = 0.02;
-    let f = 0.30;
+const FILMIC_A: f32 = 0.15;
+const FILMIC_B: f32 = 0.50;
+const FILMIC_C: f32 = 0.10;
+const FILMIC_D: f32 = 0.20;
+const FILMIC_E: f32 = 0.02;
+const FILMIC_F: f32 = 0.30;
 
-    ((x * (a * x + b * c) + d * e) / (x * (a * x + b) + d * f)) - e / f
+fn apply_filmic_curve(x: f32) -> f32 {
+    let x = x.max(0.0);
+    let denominator = x * (FILMIC_A * x + FILMIC_B) + FILMIC_D * FILMIC_F;
+    if denominator.abs() < 1e-10 {
+        return 0.0;
+    }
+    let result = ((x * (FILMIC_A * x + FILMIC_B * FILMIC_C) + FILMIC_D * FILMIC_E) / denominator)
+        - FILMIC_E / FILMIC_F;
+    if result.is_nan() {
+        0.0
+    } else {
+        result
+    }
 }
 
 fn tonemap_gamma(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
     let gamma = 1.0 / 2.2;
 
-    // Collect all pixels for parallel processing
-    let pixels: Vec<(u32, u32, [f32; 4])> = (0..hdr.height)
-        .flat_map(|y| {
-            (0..hdr.width).map(move |x| {
-                let pixel = hdr.data.get_pixel(x, y);
-                (x, y, [pixel[0], pixel[1], pixel[2], pixel[3]])
-            })
-        })
-        .collect();
-
-    // Process pixels in parallel
-    let processed: Vec<(u32, u32, Rgb<u8>)> = pixels
-        .par_iter()
-        .map(|(x, y, pixel)| {
+    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+        .into_par_iter()
+        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let pixel = hdr.data.get_pixel(x, y);
             let mut r = pixel[0] * settings.exposure;
             let mut g = pixel[1] * settings.exposure;
             let mut b = pixel[2] * settings.exposure;
 
-            // Apply temperature and tint
             (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
 
-            // Apply contrast before gamma
             r = apply_contrast(r, settings.contrast);
             g = apply_contrast(g, settings.contrast);
             b = apply_contrast(b, settings.contrast);
 
-            // Apply shadows/highlights
             (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-
-            // Apply hue shift
             (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-
-            // Apply saturation and vibrance
             (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
 
             let rgb = Rgb([
@@ -250,11 +401,10 @@ fn tonemap_gamma(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicIm
                 (g.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
                 (b.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
             ]);
-            (*x, *y, rgb)
+            (x, y, rgb)
         })
         .collect();
 
-    // Write results back
     let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
     for (x, y, rgb) in processed {
         output.put_pixel(x, y, rgb);
@@ -264,14 +414,15 @@ fn tonemap_gamma(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicIm
 }
 
 fn srgb_to_gamma(linear: f32) -> f32 {
-    if linear <= 0.0031308 {
-        linear * 12.92
+    if linear <= SRGB_THRESHOLD {
+        linear * SRGB_LINEAR_FACTOR
     } else {
-        1.055 * linear.powf(1.0 / 2.4) - 0.055
+        SRGB_GAMMA_FACTOR * linear.powf(SRGB_GAMMA_EXPONENT) - SRGB_GAMMA_OFFSET
     }
 }
 
 fn apply_contrast(value: f32, contrast: f32) -> f32 {
+    let contrast = contrast.max(0.01);
     0.5 + (value - 0.5) * contrast
 }
 
@@ -322,19 +473,21 @@ fn apply_shadows_highlights(
     )
 }
 
+const EPSILON: f32 = 1e-6;
+
 fn rgb_to_hsv(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let delta = max - min;
 
     let v = max;
-    let s = if max > 0.0 { delta / max } else { 0.0 };
+    let s = if max > EPSILON { delta / max } else { 0.0 };
 
-    let h = if delta == 0.0 {
+    let h = if delta < EPSILON {
         0.0
-    } else if max == r {
+    } else if (max - r).abs() < EPSILON {
         60.0 * ((g - b) / delta + if g < b { 6.0 } else { 0.0 })
-    } else if max == g {
+    } else if (max - g).abs() < EPSILON {
         60.0 * ((b - r) / delta + 2.0)
     } else {
         60.0 * ((r - g) / delta + 4.0)
@@ -425,11 +578,27 @@ fn apply_sharpen_blur(image: &DynamicImage, amount: f32) -> Result<DynamicImage,
 }
 
 fn calculate_luminance_stats(hdr: &HdrImage) -> (f32, f32) {
+    let data = hdr.data.as_ref();
     let mut sum_lum = 0.0f32;
     let mut max_lum = 0.0f32;
-    let pixel_count = (hdr.width * hdr.height) as f32;
+    let pixel_count = (hdr.width as u64 * hdr.height as u64) as f32;
 
-    for pixel in hdr.data.pixels() {
+    for pixel in data.pixels() {
+        let lum = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+        sum_lum += lum;
+        max_lum = max_lum.max(lum);
+    }
+
+    let avg_lum = sum_lum / pixel_count;
+    (avg_lum, max_lum)
+}
+
+fn calculate_luminance_stats_arc(data: &Rgba32FImage, width: u32, height: u32) -> (f32, f32) {
+    let mut sum_lum = 0.0f32;
+    let mut max_lum = 0.0f32;
+    let pixel_count = (width as u64 * height as u64) as f32;
+
+    for pixel in data.pixels() {
         let lum = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
         sum_lum += lum;
         max_lum = max_lum.max(lum);

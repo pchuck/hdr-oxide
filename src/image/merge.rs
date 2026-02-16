@@ -2,9 +2,10 @@ use crate::error::HdrError;
 use crate::image::loader::SourceImage;
 use image::{ImageBuffer, Rgba, Rgba32FImage};
 use rayon::prelude::*;
+use std::sync::Arc;
 
 pub struct HdrImage {
-    pub data: Rgba32FImage,
+    pub data: Arc<Rgba32FImage>,
     pub width: u32,
     pub height: u32,
 }
@@ -13,7 +14,7 @@ impl HdrImage {
     pub fn new(width: u32, height: u32) -> Self {
         let data = ImageBuffer::new(width, height);
         Self {
-            data,
+            data: Arc::new(data),
             width,
             height,
         }
@@ -42,7 +43,7 @@ pub fn merge_to_hdr(images: &[SourceImage]) -> std::result::Result<HdrImage, Hdr
         }
 
         return Ok(HdrImage {
-            data: rgba,
+            data: Arc::new(rgba),
             width: img.width,
             height: img.height,
         });
@@ -68,7 +69,6 @@ pub fn merge_to_hdr(images: &[SourceImage]) -> std::result::Result<HdrImage, Hdr
     );
 
     let exposures: Vec<f32> = images.iter().map(|i| i.exposure_seconds).collect();
-    let _num_images = images.len() as f32;
 
     let img_data: Vec<image::Rgb32FImage> =
         images.iter().map(|img| img.image.to_rgb32f()).collect();
@@ -101,25 +101,25 @@ pub fn merge_to_hdr(images: &[SourceImage]) -> std::result::Result<HdrImage, Hdr
                 weight_sum += weight;
             }
 
-            let normalizer = if weight_sum > 0.0 { weight_sum } else { 1.0 };
+            let (r, g, b) = if weight_sum > 0.0 {
+                (r_sum / weight_sum, g_sum / weight_sum, b_sum / weight_sum)
+            } else {
+                log::warn!(
+                    "Pixel at ({}, {}) has zero total weight, using fallback",
+                    x,
+                    y
+                );
+                (0.0f32, 0.0f32, 0.0f32)
+            };
 
-            hdr_data.put_pixel(
-                x,
-                y,
-                Rgba([
-                    r_sum / normalizer,
-                    g_sum / normalizer,
-                    b_sum / normalizer,
-                    1.0,
-                ]),
-            );
+            hdr_data.put_pixel(x, y, Rgba([r, g, b, 1.0]));
         }
     }
 
     log::info!("HDR merge complete");
 
     Ok(HdrImage {
-        data: hdr_data,
+        data: Arc::new(hdr_data),
         width,
         height,
     })
@@ -166,18 +166,12 @@ pub fn merge_to_hdr_parallel(images: &[SourceImage]) -> std::result::Result<HdrI
         images.iter().map(|img| img.image.to_rgb32f()).collect();
 
     let exposures: Vec<f32> = images.iter().map(|i| i.exposure_seconds).collect();
-    let min_exposure = exposures.iter().cloned().fold(f32::INFINITY, f32::min);
-    let _relative_exposures: Vec<f32> = exposures.iter().map(|e| min_exposure / e).collect();
-    let _num_images = images.len() as f32;
 
     let mut hdr_data: Rgba32FImage = ImageBuffer::new(width, height);
 
-    let pixels: Vec<(u32, u32)> = (0..height)
-        .flat_map(|y| (0..width).map(move |x| (x, y)))
-        .collect();
-
-    let results: Vec<(u32, u32, f32, f32, f32)> = pixels
-        .par_iter()
+    let results: Vec<(u32, u32, f32, f32, f32)> = (0..height)
+        .into_par_iter()
+        .flat_map(|y| (0..width).into_par_iter().map(move |x| (x, y)))
         .map(|(x, y)| {
             let mut r_sum = 0.0f32;
             let mut g_sum = 0.0f32;
@@ -185,7 +179,7 @@ pub fn merge_to_hdr_parallel(images: &[SourceImage]) -> std::result::Result<HdrI
             let mut weight_sum = 0.0f32;
 
             for (img_idx, rgb) in img_data.iter().enumerate() {
-                let pixel = rgb.get_pixel(*x, *y);
+                let pixel = rgb.get_pixel(x, y);
 
                 let orig_r = pixel[0];
                 let orig_g = pixel[1];
@@ -203,15 +197,13 @@ pub fn merge_to_hdr_parallel(images: &[SourceImage]) -> std::result::Result<HdrI
                 weight_sum += weight;
             }
 
-            let normalizer = if weight_sum > 0.0 { weight_sum } else { 1.0 };
+            let (r, g, b) = if weight_sum > 0.0 {
+                (r_sum / weight_sum, g_sum / weight_sum, b_sum / weight_sum)
+            } else {
+                (0.0f32, 0.0f32, 0.0f32)
+            };
 
-            (
-                *x,
-                *y,
-                r_sum / normalizer,
-                g_sum / normalizer,
-                b_sum / normalizer,
-            )
+            (x, y, r, g, b)
         })
         .collect();
 
@@ -222,7 +214,7 @@ pub fn merge_to_hdr_parallel(images: &[SourceImage]) -> std::result::Result<HdrI
     log::info!("HDR merge complete (parallel)");
 
     Ok(HdrImage {
-        data: hdr_data,
+        data: Arc::new(hdr_data),
         width,
         height,
     })

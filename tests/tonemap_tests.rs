@@ -1,6 +1,7 @@
 use hdr_oxide::image::merge::HdrImage;
 use hdr_oxide::image::tonemap::{tonemap_hdr, TonemapSettings};
 use image::{ImageBuffer, Rgba, Rgba32FImage};
+use std::sync::Arc;
 
 fn create_test_hdr(width: u32, height: u32, color: [f32; 4]) -> HdrImage {
     let mut data: Rgba32FImage = ImageBuffer::new(width, height);
@@ -10,7 +11,7 @@ fn create_test_hdr(width: u32, height: u32, color: [f32; 4]) -> HdrImage {
         }
     }
     HdrImage {
-        data,
+        data: Arc::new(data),
         width,
         height,
     }
@@ -107,7 +108,7 @@ fn test_tonemap_sharpen_blur() {
         }
     }
     let hdr = HdrImage {
-        data,
+        data: Arc::new(data),
         width: 8,
         height: 8,
     };

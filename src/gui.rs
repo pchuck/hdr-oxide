@@ -1,26 +1,28 @@
 use crate::error::HdrError;
 use crate::image::merge::{merge_to_hdr_parallel, HdrImage};
-use crate::image::tonemap::{tonemap_hdr, TonemapSettings};
+use crate::image::tonemap::{tonemap_hdr_arc, TonemapSettings};
 use eframe::egui;
 use image::{DynamicImage, GenericImageView};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-const PREVIEW_SIZE: u32 = 100;
+const PREVIEW_SIZE: u32 = 256;
 
 pub enum GuiCommand {
     MergeComplete(Result<HdrImage, String>),
     LoadError(String),
     SaveComplete(Result<(), String>),
     PreviewComplete(Result<image::RgbaImage, String>),
-    ImageLoaded(PathBuf, DynamicImage),
+    ImageLoaded(PathBuf, Arc<DynamicImage>, egui::ColorImage),
+    FilesSelected(Vec<PathBuf>),
 }
 
 pub struct HdrApp {
     input_paths: Vec<PathBuf>,
-    preloaded_images: Vec<(PathBuf, DynamicImage)>,
+    preloaded_images: Vec<(PathBuf, Arc<DynamicImage>)>,
     preloaded_textures: std::collections::HashMap<PathBuf, egui::TextureHandle>,
     loading_paths: Vec<PathBuf>,
     pending_load_queue: Vec<PathBuf>,
@@ -38,7 +40,7 @@ pub struct HdrApp {
     last_tint: f32,
     last_hue_shift: f32,
     last_sharpen: f32,
-    hdr_image: Option<HdrImage>,
+    hdr_image: Option<Arc<HdrImage>>,
     preview_texture: Option<egui::TextureHandle>,
     tonemap_method: String,
     exposure: f32,
@@ -57,6 +59,7 @@ pub struct HdrApp {
     path_input: String,
     show_about: bool,
     about_texture: Option<egui::TextureHandle>,
+    cancel_token: Option<Arc<AtomicBool>>,
 }
 
 impl Default for HdrApp {
@@ -100,6 +103,7 @@ impl Default for HdrApp {
             path_input: String::new(),
             show_about: false,
             about_texture: None,
+            cancel_token: None,
         }
     }
 }
@@ -214,20 +218,47 @@ impl HdrApp {
         self.loading_paths = paths.clone();
         self.status = format!("{} images (loading)", self.input_paths.len());
 
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        self.cancel_token = Some(Arc::clone(&cancel_token));
+
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
 
         thread::spawn(move || {
-            for path in paths {
-                match image::open(&path) {
+            use rayon::prelude::*;
+
+            paths.into_par_iter().for_each(|path| {
+                if cancel_token.load(Ordering::Relaxed) {
+                    return;
+                }
+                let result = image::open(&path);
+                if cancel_token.load(Ordering::Relaxed) {
+                    return;
+                }
+                match result {
                     Ok(img) => {
-                        let _ = tx.send(GuiCommand::ImageLoaded(path, img));
+                        let resized = img.resize(
+                            PREVIEW_SIZE,
+                            PREVIEW_SIZE,
+                            image::imageops::FilterType::Lanczos3,
+                        );
+                        let rgba = resized.to_rgba8();
+                        let (width, height) = rgba.dimensions();
+                        let pixels: Vec<egui::Color32> = rgba
+                            .pixels()
+                            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+                            .collect();
+                        let color_image = egui::ColorImage {
+                            size: [width as usize, height as usize],
+                            pixels,
+                        };
+                        let _ = tx.send(GuiCommand::ImageLoaded(path, Arc::new(img), color_image));
                     }
                     Err(e) => {
                         let _ = tx.send(GuiCommand::LoadError(format!("Failed to load: {}", e)));
                     }
                 }
-            }
+            });
         });
     }
 
@@ -272,35 +303,40 @@ impl HdrApp {
     }
 
     fn clear_images(&mut self) {
+        if let Some(token) = &self.cancel_token {
+            token.store(true, Ordering::Relaxed);
+        }
+        self.cancel_token = None;
         self.input_paths.clear();
         self.preloaded_images.clear();
         self.preloaded_textures.clear();
         self.loading_paths.clear();
         self.pending_load_queue.clear();
         self.is_loading = false;
+        self.is_generating = false;
         self.hdr_image = None;
         self.preview_texture = None;
         self.status = "Cleared".to_string();
     }
 
     fn open_file_dialog(&mut self) {
-        if self.is_generating {
+        if self.is_generating || self.is_loading {
             return;
         }
 
-        let files = rfd::FileDialog::new()
-            .add_filter("Images", &["jpg", "jpeg", "png", "tif", "tiff"])
-            .set_title("Select Images for HDR")
-            .pick_files();
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.is_loading = true;
+        self.status = "Opening file dialog...".to_string();
 
-        match files {
-            Some(paths) if !paths.is_empty() => {
-                self.add_multiple_paths(&paths);
-            }
-            _ => {
-                self.status = "No files selected".to_string();
-            }
-        }
+        thread::spawn(move || {
+            let files = rfd::FileDialog::new()
+                .add_filter("Images", &["jpg", "jpeg", "png", "tif", "tiff"])
+                .set_title("Select Images for HDR")
+                .pick_files();
+
+            let _ = tx.send(GuiCommand::FilesSelected(files.unwrap_or_default()));
+        });
     }
 
     fn start_merge(&mut self) {
@@ -336,7 +372,7 @@ impl HdrApp {
                     }
                 };
 
-                images.push(SourceImage::new(path, img, exposure));
+                images.push(SourceImage::new(path, (*img).clone(), exposure));
             }
 
             match merge_to_hdr_parallel(&images) {
@@ -365,7 +401,7 @@ impl HdrApp {
         for cmd in commands {
             match cmd {
                 GuiCommand::MergeComplete(Ok(hdr)) => {
-                    self.hdr_image = Some(hdr);
+                    self.hdr_image = Some(Arc::new(hdr));
                     self.status = "HDR ready".to_string();
                     self.is_generating = false;
                     self.needs_hdr = false;
@@ -404,33 +440,16 @@ impl HdrApp {
                     self.is_generating = false;
                     self.rx = None;
                 }
-                GuiCommand::ImageLoaded(path, img) => {
+                GuiCommand::ImageLoaded(path, img, thumbnail) => {
                     self.loading_paths.retain(|p| *p != path);
-                    self.preloaded_images.push((path.clone(), img.clone()));
-
-                    let resized = img.resize(
-                        PREVIEW_SIZE,
-                        PREVIEW_SIZE,
-                        image::imageops::FilterType::Triangle,
-                    );
-                    let rgba = resized.to_rgba8();
-                    let (width, height) = rgba.dimensions();
-                    let pixels: Vec<egui::Color32> = rgba
-                        .pixels()
-                        .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
-                        .collect();
-
-                    let color_image = egui::ColorImage {
-                        size: [width as usize, height as usize],
-                        pixels,
-                    };
+                    self.preloaded_images.push((path.clone(), img));
 
                     let texture = ctx.load_texture(
                         format!(
                             "img_{}",
                             path.file_name().unwrap_or_default().to_string_lossy()
                         ),
-                        Arc::new(color_image),
+                        Arc::new(thumbnail),
                         egui::TextureOptions::LINEAR,
                     );
 
@@ -442,6 +461,15 @@ impl HdrApp {
                         self.is_loading = false;
                         self.rx = None;
                         self.process_queued_loads();
+                    }
+                }
+                GuiCommand::FilesSelected(paths) => {
+                    self.is_loading = false;
+                    if paths.is_empty() {
+                        self.status = "No files selected".to_string();
+                        self.rx = None;
+                    } else {
+                        self.add_multiple_paths(&paths);
                     }
                 }
             }
@@ -456,11 +484,7 @@ impl HdrApp {
         self.is_generating = true;
         self.status = "Updating preview...".to_string();
 
-        let hdr_clone = HdrImage {
-            data: self.hdr_image.as_ref().unwrap().data.clone(),
-            width: self.hdr_image.as_ref().unwrap().width,
-            height: self.hdr_image.as_ref().unwrap().height,
-        };
+        let hdr_arc = Arc::clone(self.hdr_image.as_ref().unwrap());
         let tonemap_method = self.tonemap_method.clone();
         let settings = TonemapSettings {
             exposure: self.exposure,
@@ -478,8 +502,8 @@ impl HdrApp {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
 
-        thread::spawn(
-            move || match tonemap_hdr(&hdr_clone, &tonemap_method, &settings) {
+        thread::spawn(move || -> () {
+            match tonemap_hdr_arc(hdr_arc, &tonemap_method, &settings) {
                 Ok(tonemapped) => {
                     let rgba = tonemapped.to_rgba8();
                     let _ = tx.send(GuiCommand::PreviewComplete(Ok(rgba)));
@@ -487,8 +511,8 @@ impl HdrApp {
                 Err(e) => {
                     let _ = tx.send(GuiCommand::PreviewComplete(Err(e.to_string())));
                 }
-            },
-        );
+            }
+        });
     }
 
     fn apply_preview_texture(&mut self, ctx: &egui::Context, image: image::RgbaImage) {
@@ -519,11 +543,7 @@ impl HdrApp {
         self.is_generating = true;
         self.status = "Saving HDR...".to_string();
 
-        let hdr_clone = HdrImage {
-            data: self.hdr_image.as_ref().unwrap().data.clone(),
-            width: self.hdr_image.as_ref().unwrap().width,
-            height: self.hdr_image.as_ref().unwrap().height,
-        };
+        let hdr_arc = Arc::clone(self.hdr_image.as_ref().unwrap());
         let tonemap_method = self.tonemap_method.clone();
         let settings = TonemapSettings {
             exposure: self.exposure,
@@ -541,7 +561,7 @@ impl HdrApp {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
 
-        thread::spawn(move || {
+        thread::spawn(move || -> () {
             let file = rfd::FileDialog::new()
                 .add_filter("PNG", &["png"])
                 .add_filter("JPEG", &["jpg", "jpeg"])
@@ -550,7 +570,7 @@ impl HdrApp {
                 .save_file();
 
             match file {
-                Some(path) => match tonemap_hdr(&hdr_clone, &tonemap_method, &settings) {
+                Some(path) => match tonemap_hdr_arc(hdr_arc, &tonemap_method, &settings) {
                     Ok(tonemapped) => match tonemapped.save(&path) {
                         Ok(()) => {
                             let _ = tx.send(GuiCommand::SaveComplete(Ok(())));
@@ -598,10 +618,8 @@ impl eframe::App for HdrApp {
 
             ui.collapsing("Source Images", |ui| {
                 ui.label("Add images:");
-                if ui.button("Open Files...").clicked() {
-                    if !self.is_generating {
-                        self.open_file_dialog();
-                    }
+                if ui.button("Open Files...").clicked() && !self.is_generating && !self.is_loading {
+                    self.open_file_dialog();
                 }
 
                 ui.separator();
@@ -850,18 +868,33 @@ impl eframe::App for HdrApp {
                 ui.label("Add images and click 'Create HDR'");
             }
         });
+
+        if self.is_loading || self.is_generating {
+            ctx.request_repaint();
+        }
     }
 }
 
 fn load_about_image() -> Option<image::DynamicImage> {
-    let about_path = std::path::PathBuf::from("resources/sample.png");
-    match image::open(&about_path) {
-        Ok(img) => Some(img),
-        Err(e) => {
-            log::warn!("Could not load about image from {:?}: {}", about_path, e);
-            None
+    let paths_to_try = vec![
+        std::path::PathBuf::from("resources/sample.png"),
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.join("resources/sample.png")))
+            .unwrap_or_default(),
+    ];
+
+    for about_path in paths_to_try {
+        if about_path.exists() {
+            match image::open(&about_path) {
+                Ok(img) => return Some(img),
+                Err(e) => {
+                    log::warn!("Could not load about image from {:?}: {}", about_path, e);
+                }
+            }
         }
     }
+    None
 }
 
 pub fn run_gui() -> Result<(), HdrError> {
