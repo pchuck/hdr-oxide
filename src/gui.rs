@@ -1,6 +1,6 @@
 use crate::error::HdrError;
 use crate::image::merge::HdrImage;
-use crate::image::tonemap::{tonemap_hdr_arc, TonemapSettings};
+use crate::image::tonemap::{tonemap_hdr_arc_with_progress, TonemapSettings};
 use eframe::egui;
 use image::{DynamicImage, GenericImageView};
 use std::path::PathBuf;
@@ -10,13 +10,43 @@ use std::sync::Arc;
 use std::thread;
 
 const PREVIEW_SIZE: u32 = 256;
+const WORKING_MAX_DIMENSION: u32 = 2048;
+
+pub struct SourceImages {
+    full: Arc<DynamicImage>,
+    working: Arc<DynamicImage>,
+    exposure_seconds: f32,
+}
+
+impl SourceImages {
+    fn new(img: DynamicImage, exposure_seconds: f32) -> Self {
+        let working = Self::resize_to_working(&img);
+        Self {
+            full: Arc::new(img),
+            working: Arc::new(working),
+            exposure_seconds,
+        }
+    }
+
+    fn resize_to_working(img: &DynamicImage) -> DynamicImage {
+        let (w, h) = img.dimensions();
+        let max_dim = w.max(h);
+        if max_dim <= WORKING_MAX_DIMENSION {
+            return img.clone();
+        }
+        let scale = WORKING_MAX_DIMENSION as f32 / max_dim as f32;
+        let new_w = (w as f32 * scale) as u32;
+        let new_h = (h as f32 * scale) as u32;
+        img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
+    }
+}
 
 pub enum GuiCommand {
     MergeComplete(Result<HdrImage, String>),
     LoadError(String),
     SaveComplete(Result<(), String>),
     PreviewComplete(Result<image::RgbaImage, String>),
-    ImageLoaded(PathBuf, Arc<DynamicImage>, egui::ColorImage),
+    ImageLoaded(PathBuf, SourceImages, egui::ColorImage),
     FilesSelected(Vec<PathBuf>),
     Progress {
         stage: String,
@@ -28,7 +58,7 @@ pub enum GuiCommand {
 
 pub struct HdrApp {
     input_paths: Vec<PathBuf>,
-    preloaded_images: Vec<(PathBuf, Arc<DynamicImage>)>,
+    preloaded_images: Vec<(PathBuf, SourceImages)>,
     preloaded_textures: std::collections::HashMap<PathBuf, egui::TextureHandle>,
     loading_paths: Vec<PathBuf>,
     pending_load_queue: Vec<PathBuf>,
@@ -263,7 +293,18 @@ impl HdrApp {
                 }
                 match result {
                     Ok(img) => {
-                        let resized = img.resize(
+                        let exposure = crate::image::loader::extract_exposure_time(&path)
+                            .unwrap_or_else(|_| {
+                                log::warn!(
+                                    "Could not read exposure from {:?}, assuming 1/125",
+                                    path
+                                );
+                                1.0 / 125.0
+                            });
+
+                        let source_images = SourceImages::new(img, exposure);
+
+                        let resized = source_images.working.resize(
                             PREVIEW_SIZE,
                             PREVIEW_SIZE,
                             image::imageops::FilterType::Lanczos3,
@@ -278,7 +319,7 @@ impl HdrApp {
                             size: [width as usize, height as usize],
                             pixels,
                         };
-                        let _ = tx.send(GuiCommand::ImageLoaded(path, Arc::new(img), color_image));
+                        let _ = tx.send(GuiCommand::ImageLoaded(path, source_images, color_image));
                     }
                     Err(e) => {
                         let _ = tx.send(GuiCommand::LoadError(format!("Failed to load: {}", e)));
@@ -380,7 +421,12 @@ impl HdrApp {
             return;
         }
 
-        let preloaded = self.preloaded_images.clone();
+        let preloaded: Vec<(PathBuf, Arc<DynamicImage>, f32)> = self
+            .preloaded_images
+            .iter()
+            .map(|(path, src)| (path.clone(), Arc::clone(&src.working), src.exposure_seconds))
+            .collect();
+
         self.is_generating = true;
         self.progress_stage = "Merging HDR".to_string();
         self.progress_current = 0;
@@ -391,29 +437,22 @@ impl HdrApp {
         self.rx = Some(rx);
 
         thread::spawn(move || {
-            use crate::image::loader::{extract_exposure_time, SourceImage};
+            use crate::image::loader::SourceImage;
 
             let mut images = Vec::with_capacity(preloaded.len());
 
-            for (path, img) in preloaded {
-                let exposure = match extract_exposure_time(&path) {
-                    Ok(exp) => exp,
-                    Err(_) => {
-                        log::warn!("Could not read exposure from {:?}, assuming 1/125", path);
-                        1.0 / 125.0
-                    }
-                };
-
+            for (path, img, exposure) in preloaded {
                 images.push(SourceImage::new(path, (*img).clone(), exposure));
             }
 
+            let total_pixels = images[0].width as usize * images[0].height as usize;
             let tx_progress = tx.clone();
             let result =
-                crate::image::merge::merge_to_hdr_parallel_with_progress(&images, |count| {
+                crate::image::merge::merge_to_hdr_parallel_with_progress(&images, move |count| {
                     let _ = tx_progress.send(GuiCommand::Progress {
                         stage: "Merging HDR".to_string(),
                         current: count,
-                        total: images[0].width as usize * images[0].height as usize,
+                        total: total_pixels,
                     });
                 });
 
@@ -470,6 +509,8 @@ impl HdrApp {
                     self.rx = None;
                 }
                 GuiCommand::PreviewComplete(result) => {
+                    self.is_generating = false;
+                    self.rx = None;
                     match result {
                         Ok(image) => {
                             self.apply_preview_texture(ctx, image);
@@ -483,8 +524,6 @@ impl HdrApp {
                             self.status = format!("Tonemap failed: {}", e);
                         }
                     }
-                    self.is_generating = false;
-                    self.rx = None;
                 }
                 GuiCommand::ImageLoaded(path, img, thumbnail) => {
                     self.loading_paths.retain(|p| *p != path);
@@ -642,7 +681,7 @@ impl HdrApp {
             return;
         }
 
-        let img = Arc::clone(&self.preloaded_images[self.compare_index].1);
+        let img = Arc::clone(&self.preloaded_images[self.compare_index].1.working);
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
 
@@ -670,14 +709,22 @@ impl HdrApp {
     }
 
     fn save_output(&mut self) {
-        if self.hdr_image.is_none() || self.is_generating {
+        if self.preloaded_images.is_empty() || self.is_generating {
             return;
         }
 
         self.is_generating = true;
-        self.status = "Saving HDR...".to_string();
+        self.progress_stage = "Exporting".to_string();
+        self.progress_current = 0;
+        self.progress_total = 100;
+        self.status = "Preparing full resolution HDR...".to_string();
 
-        let hdr_arc = Arc::clone(self.hdr_image.as_ref().unwrap());
+        let preloaded: Vec<(PathBuf, Arc<DynamicImage>, f32)> = self
+            .preloaded_images
+            .iter()
+            .map(|(path, src)| (path.clone(), Arc::clone(&src.full), src.exposure_seconds))
+            .collect();
+
         let tonemap_method = self.tonemap_method.clone();
         let settings = TonemapSettings {
             exposure: self.exposure,
@@ -696,6 +743,67 @@ impl HdrApp {
         self.rx = Some(rx);
 
         thread::spawn(move || -> () {
+            use crate::image::loader::SourceImage;
+
+            let mut images = Vec::with_capacity(preloaded.len());
+            for (path, img, exposure) in preloaded {
+                images.push(SourceImage::new(path, (*img).clone(), exposure));
+            }
+
+            let tx_progress = tx.clone();
+            let hdr_result =
+                crate::image::merge::merge_to_hdr_parallel_with_progress(&images, |count| {
+                    let _ = tx_progress.send(GuiCommand::Progress {
+                        stage: "Merging full-res HDR".to_string(),
+                        current: count,
+                        total: images[0].width as usize * images[0].height as usize,
+                    });
+                });
+
+            let hdr = match hdr_result {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = tx.send(GuiCommand::SaveComplete(Err(format!(
+                        "HDR merge failed: {}",
+                        e
+                    ))));
+                    return;
+                }
+            };
+
+            let _ = tx.send(GuiCommand::Progress {
+                stage: "Tonemapping".to_string(),
+                current: 0,
+                total: 100,
+            });
+
+            let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
+            let hdr_arc = Arc::new(hdr);
+            let tx_progress2 = tx.clone();
+            let tonemapped =
+                match tonemap_hdr_arc_with_progress(hdr_arc, &tonemap_method, &settings, |count| {
+                    let _ = tx_progress2.send(GuiCommand::Progress {
+                        stage: "Tonemapping".to_string(),
+                        current: count,
+                        total: total_pixels,
+                    });
+                }) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = tx.send(GuiCommand::SaveComplete(Err(format!(
+                            "Tonemap failed: {}",
+                            e
+                        ))));
+                        return;
+                    }
+                };
+
+            let _ = tx.send(GuiCommand::Progress {
+                stage: "Saving".to_string(),
+                current: 1,
+                total: 1,
+            });
+
             let file = rfd::FileDialog::new()
                 .add_filter("PNG", &["png"])
                 .add_filter("JPEG", &["jpg", "jpeg"])
@@ -704,15 +812,10 @@ impl HdrApp {
                 .save_file();
 
             match file {
-                Some(path) => match tonemap_hdr_arc(hdr_arc, &tonemap_method, &settings) {
-                    Ok(tonemapped) => match tonemapped.save(&path) {
-                        Ok(()) => {
-                            let _ = tx.send(GuiCommand::SaveComplete(Ok(())));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(GuiCommand::SaveComplete(Err(e.to_string())));
-                        }
-                    },
+                Some(path) => match tonemapped.save(&path) {
+                    Ok(()) => {
+                        let _ = tx.send(GuiCommand::SaveComplete(Ok(())));
+                    }
                     Err(e) => {
                         let _ = tx.send(GuiCommand::SaveComplete(Err(e.to_string())));
                     }
