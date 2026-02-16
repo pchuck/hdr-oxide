@@ -70,6 +70,10 @@ pub struct HdrApp {
     show_about: bool,
     about_texture: Option<egui::TextureHandle>,
     cancel_token: Option<Arc<AtomicBool>>,
+    compare_mode: bool,
+    compare_position: f32,
+    compare_index: usize,
+    compare_texture: Option<egui::TextureHandle>,
 }
 
 impl Default for HdrApp {
@@ -119,6 +123,10 @@ impl Default for HdrApp {
             show_about: false,
             about_texture: None,
             cancel_token: None,
+            compare_mode: false,
+            compare_position: 0.5,
+            compare_index: 0,
+            compare_texture: None,
         }
     }
 }
@@ -335,6 +343,8 @@ impl HdrApp {
         self.loaded_count = 0;
         self.hdr_image = None;
         self.preview_texture = None;
+        self.compare_mode = false;
+        self.compare_texture = None;
         self.status = "Cleared".to_string();
     }
 
@@ -463,6 +473,9 @@ impl HdrApp {
                         Ok(image) => {
                             self.apply_preview_texture(ctx, image);
                             self.save_last_settings();
+                            if self.compare_mode {
+                                self.update_compare_texture(ctx);
+                            }
                         }
                         Err(e) => {
                             self.status = format!("Tonemap failed: {}", e);
@@ -600,6 +613,38 @@ impl HdrApp {
             egui::TextureOptions::LINEAR,
         ));
         self.status = "Preview ready".to_string();
+    }
+
+    fn toggle_compare_mode(&mut self, ctx: &egui::Context) {
+        self.compare_mode = !self.compare_mode;
+        if self.compare_mode {
+            self.compare_position = 0.5;
+            self.compare_index = 0;
+            self.update_compare_texture(ctx);
+        } else {
+            self.compare_texture = None;
+        }
+    }
+
+    fn update_compare_texture(&mut self, ctx: &egui::Context) {
+        if self.compare_index < self.preloaded_images.len() {
+            let (_, img) = &self.preloaded_images[self.compare_index];
+            let size = img.dimensions();
+            let rgba = img.to_rgba8();
+            let pixels: Vec<egui::Color32> = rgba
+                .pixels()
+                .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+                .collect();
+            let color_image = egui::ColorImage {
+                size: [size.0 as usize, size.1 as usize],
+                pixels,
+            };
+            self.compare_texture = Some(ctx.load_texture(
+                "compare_source",
+                Arc::new(color_image),
+                egui::TextureOptions::LINEAR,
+            ));
+        }
     }
 
     fn save_output(&mut self) {
@@ -766,6 +811,8 @@ impl eframe::App for HdrApp {
                         self.loading_paths.retain(|p| *p != path);
                         self.hdr_image = None;
                         self.preview_texture = None;
+                        self.compare_mode = false;
+                        self.compare_texture = None;
                         self.needs_hdr = true;
                         self.settings_changed = true;
                     }
@@ -819,6 +866,34 @@ impl eframe::App for HdrApp {
                     self.save_output();
                 }
             });
+
+            let can_compare = self.preview_texture.is_some() && !self.preloaded_images.is_empty();
+            if ui
+                .add_enabled(can_compare, egui::Button::new("Compare"))
+                .clicked()
+            {
+                self.toggle_compare_mode(ctx);
+            }
+
+            if self.compare_mode && !self.preloaded_images.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label("Compare with:");
+                    let num_images = self.preloaded_images.len();
+                    if ui.button("◀").clicked() {
+                        self.compare_index = if self.compare_index == 0 {
+                            num_images - 1
+                        } else {
+                            self.compare_index - 1
+                        };
+                        self.update_compare_texture(ctx);
+                    }
+                    ui.label(format!("{}/{}", self.compare_index + 1, num_images));
+                    if ui.button("▶").clicked() {
+                        self.compare_index = (self.compare_index + 1) % num_images;
+                        self.update_compare_texture(ctx);
+                    }
+                });
+            }
 
             ui.label("Tonemap:");
             egui::ComboBox::from_label("Method")
@@ -935,9 +1010,92 @@ impl eframe::App for HdrApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Preview");
+            if self.compare_mode {
+                if let (Some(preview), Some(compare)) =
+                    (&self.preview_texture, &self.compare_texture)
+                {
+                    let preview_size = preview.size();
+                    let available = ui.available_size();
+                    let scale = (available.x / preview_size[0] as f32)
+                        .min(available.y / preview_size[1] as f32)
+                        .min(1.0);
+                    let display_size = egui::vec2(
+                        preview_size[0] as f32 * scale,
+                        preview_size[1] as f32 * scale,
+                    );
 
-            if let Some(ref texture) = self.preview_texture {
+                    let (rect, response) =
+                        ui.allocate_exact_size(display_size, egui::Sense::drag());
+
+                    let divider_x = rect.left() + rect.width() * self.compare_position;
+
+                    let mut clip_rect_left = ui.clip_rect();
+                    clip_rect_left.max.x = divider_x;
+
+                    let mut clip_rect_right = ui.clip_rect();
+                    clip_rect_right.min.x = divider_x;
+
+                    {
+                        let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                        child_ui.set_clip_rect(clip_rect_left);
+                        child_ui.image((compare.id(), display_size));
+                    }
+
+                    {
+                        let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                        child_ui.set_clip_rect(clip_rect_right);
+                        child_ui.image((preview.id(), display_size));
+                    }
+
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(divider_x, rect.top()),
+                            egui::pos2(divider_x, rect.bottom()),
+                        ],
+                        egui::Stroke::new(2.0, egui::Color32::WHITE),
+                    );
+
+                    let handle_radius = 8.0;
+                    let handle_center = egui::pos2(divider_x, rect.center().y);
+                    ui.painter()
+                        .circle_filled(handle_center, handle_radius, egui::Color32::WHITE);
+                    ui.painter().circle_stroke(
+                        handle_center,
+                        handle_radius,
+                        egui::Stroke::new(2.0, egui::Color32::BLACK),
+                    );
+
+                    let label_pos = egui::pos2(rect.left() + 10.0, rect.top() + 10.0);
+                    ui.painter().text(
+                        label_pos,
+                        egui::Align2::LEFT_TOP,
+                        "Original",
+                        egui::FontId::default(),
+                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 200),
+                    );
+                    let label_pos = egui::pos2(rect.right() - 10.0, rect.top() + 10.0);
+                    ui.painter().text(
+                        label_pos,
+                        egui::Align2::RIGHT_TOP,
+                        "HDR",
+                        egui::FontId::default(),
+                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 200),
+                    );
+
+                    if response.dragged() {
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let new_pos = (pos.x - rect.left()) / rect.width();
+                            self.compare_position = new_pos.clamp(0.0, 1.0);
+                        }
+                    }
+
+                    ui.label("Drag to compare");
+                } else {
+                    ui.label("Loading comparison...");
+                }
+            } else if let Some(ref texture) = self.preview_texture {
+                ui.heading("Preview");
+
                 let size = texture.size();
                 let available = ui.available_size();
                 let scale = (available.x / size[0] as f32)
@@ -947,6 +1105,7 @@ impl eframe::App for HdrApp {
 
                 ui.add(egui::Image::new(texture).max_size(scaled_size));
             } else {
+                ui.heading("Preview");
                 ui.label("Add images and click 'Create HDR'");
             }
         });
