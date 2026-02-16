@@ -2,6 +2,7 @@ use crate::error::HdrError;
 use crate::image::loader::SourceImage;
 use image::{ImageBuffer, Rgba, Rgba32FImage};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub struct HdrImage {
@@ -139,6 +140,16 @@ fn calculate_weight(r: f32, g: f32, b: f32) -> f32 {
 }
 
 pub fn merge_to_hdr_parallel(images: &[SourceImage]) -> std::result::Result<HdrImage, HdrError> {
+    merge_to_hdr_parallel_with_progress(images, |_| {})
+}
+
+pub fn merge_to_hdr_parallel_with_progress<F>(
+    images: &[SourceImage],
+    progress_callback: F,
+) -> std::result::Result<HdrImage, HdrError>
+where
+    F: Fn(usize) + Send + Sync,
+{
     if images.is_empty() {
         return Err(HdrError::Merge("No images to merge".to_string()));
     }
@@ -168,6 +179,10 @@ pub fn merge_to_hdr_parallel(images: &[SourceImage]) -> std::result::Result<HdrI
     let exposures: Vec<f32> = images.iter().map(|i| i.exposure_seconds).collect();
 
     let mut hdr_data: Rgba32FImage = ImageBuffer::new(width, height);
+    let total_pixels = height as usize;
+    let processed = Arc::new(AtomicUsize::new(0));
+    let last_reported = Arc::new(AtomicUsize::new(0));
+    let progress_callback = Arc::new(progress_callback);
 
     let results: Vec<(u32, u32, f32, f32, f32)> = (0..height)
         .into_par_iter()
@@ -203,9 +218,17 @@ pub fn merge_to_hdr_parallel(images: &[SourceImage]) -> std::result::Result<HdrI
                 (0.0f32, 0.0f32, 0.0f32)
             };
 
+            let count = processed.fetch_add(1, Ordering::Relaxed);
+            if count.saturating_sub(last_reported.load(Ordering::Relaxed)) >= total_pixels / 100 {
+                last_reported.store(count, Ordering::Relaxed);
+                progress_callback(count);
+            }
+
             (x, y, r, g, b)
         })
         .collect();
+
+    progress_callback(total_pixels);
 
     for (x, y, r, g, b) in results {
         hdr_data.put_pixel(x, y, Rgba([r, g, b, 1.0]));

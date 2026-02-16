@@ -1,5 +1,5 @@
 use crate::error::HdrError;
-use crate::image::merge::{merge_to_hdr_parallel, HdrImage};
+use crate::image::merge::HdrImage;
 use crate::image::tonemap::{tonemap_hdr_arc, TonemapSettings};
 use eframe::egui;
 use image::{DynamicImage, GenericImageView};
@@ -18,6 +18,11 @@ pub enum GuiCommand {
     PreviewComplete(Result<image::RgbaImage, String>),
     ImageLoaded(PathBuf, Arc<DynamicImage>, egui::ColorImage),
     FilesSelected(Vec<PathBuf>),
+    Progress {
+        stage: String,
+        current: usize,
+        total: usize,
+    },
 }
 
 pub struct HdrApp {
@@ -27,6 +32,8 @@ pub struct HdrApp {
     loading_paths: Vec<PathBuf>,
     pending_load_queue: Vec<PathBuf>,
     is_loading: bool,
+    total_loading: usize,
+    loaded_count: usize,
     needs_hdr: bool,
     settings_changed: bool,
     last_tonemap_method: String,
@@ -55,6 +62,9 @@ pub struct HdrApp {
     sharpen: f32,
     status: String,
     is_generating: bool,
+    progress_stage: String,
+    progress_current: usize,
+    progress_total: usize,
     rx: Option<mpsc::Receiver<GuiCommand>>,
     path_input: String,
     show_about: bool,
@@ -71,6 +81,8 @@ impl Default for HdrApp {
             loading_paths: Vec::new(),
             pending_load_queue: Vec::new(),
             is_loading: false,
+            total_loading: 0,
+            loaded_count: 0,
             needs_hdr: false,
             settings_changed: false,
             last_tonemap_method: "reinhard".to_string(),
@@ -99,6 +111,9 @@ impl Default for HdrApp {
             sharpen: 0.0,
             status: "Add images using 'Open Files' button".to_string(),
             is_generating: false,
+            progress_stage: String::new(),
+            progress_current: 0,
+            progress_total: 0,
             rx: None,
             path_input: String::new(),
             show_about: false,
@@ -215,8 +230,10 @@ impl HdrApp {
         }
 
         self.is_loading = true;
+        self.total_loading = paths.len();
+        self.loaded_count = 0;
         self.loading_paths = paths.clone();
-        self.status = format!("{} images (loading)", self.input_paths.len());
+        self.status = format!("Loading 0/{} images...", self.total_loading);
 
         let cancel_token = Arc::new(AtomicBool::new(false));
         self.cancel_token = Some(Arc::clone(&cancel_token));
@@ -314,6 +331,8 @@ impl HdrApp {
         self.pending_load_queue.clear();
         self.is_loading = false;
         self.is_generating = false;
+        self.total_loading = 0;
+        self.loaded_count = 0;
         self.hdr_image = None;
         self.preview_texture = None;
         self.status = "Cleared".to_string();
@@ -351,9 +370,11 @@ impl HdrApp {
         }
 
         let preloaded = self.preloaded_images.clone();
-
         self.is_generating = true;
-        self.status = "Processing...".to_string();
+        self.progress_stage = "Merging HDR".to_string();
+        self.progress_current = 0;
+        self.progress_total = 100;
+        self.status = "Merging HDR...".to_string();
 
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
@@ -375,7 +396,17 @@ impl HdrApp {
                 images.push(SourceImage::new(path, (*img).clone(), exposure));
             }
 
-            match merge_to_hdr_parallel(&images) {
+            let tx_progress = tx.clone();
+            let result =
+                crate::image::merge::merge_to_hdr_parallel_with_progress(&images, |count| {
+                    let _ = tx_progress.send(GuiCommand::Progress {
+                        stage: "Merging HDR".to_string(),
+                        current: count,
+                        total: images[0].width as usize * images[0].height as usize,
+                    });
+                });
+
+            match result {
                 Ok(hdr) => {
                     let _ = tx.send(GuiCommand::MergeComplete(Ok(hdr)));
                 }
@@ -443,6 +474,11 @@ impl HdrApp {
                 GuiCommand::ImageLoaded(path, img, thumbnail) => {
                     self.loading_paths.retain(|p| *p != path);
                     self.preloaded_images.push((path.clone(), img));
+                    self.loaded_count += 1;
+                    self.status = format!(
+                        "Loading {}/{} images...",
+                        self.loaded_count, self.total_loading
+                    );
 
                     let texture = ctx.load_texture(
                         format!(
@@ -472,6 +508,15 @@ impl HdrApp {
                         self.add_multiple_paths(&paths);
                     }
                 }
+                GuiCommand::Progress {
+                    stage,
+                    current,
+                    total,
+                } => {
+                    self.progress_stage = stage;
+                    self.progress_current = current;
+                    self.progress_total = total;
+                }
             }
         }
     }
@@ -482,7 +527,10 @@ impl HdrApp {
         }
 
         self.is_generating = true;
-        self.status = "Updating preview...".to_string();
+        self.progress_stage = "Tonemapping".to_string();
+        self.progress_current = 0;
+        self.progress_total = 100;
+        self.status = "Tonemapping...".to_string();
 
         let hdr_arc = Arc::clone(self.hdr_image.as_ref().unwrap());
         let tonemap_method = self.tonemap_method.clone();
@@ -503,7 +551,26 @@ impl HdrApp {
         self.rx = Some(rx);
 
         thread::spawn(move || -> () {
-            match tonemap_hdr_arc(hdr_arc, &tonemap_method, &settings) {
+            let total_pixels = {
+                let hdr = hdr_arc.as_ref();
+                (hdr.width as u64 * hdr.height as u64) as usize
+            };
+
+            let tx_progress = tx.clone();
+            let result = crate::image::tonemap::tonemap_hdr_arc_with_progress(
+                hdr_arc,
+                &tonemap_method,
+                &settings,
+                |count| {
+                    let _ = tx_progress.send(GuiCommand::Progress {
+                        stage: "Tonemapping".to_string(),
+                        current: count,
+                        total: total_pixels,
+                    });
+                },
+            );
+
+            match result {
                 Ok(tonemapped) => {
                     let rgba = tonemapped.to_rgba8();
                     let _ = tx.send(GuiCommand::PreviewComplete(Ok(rgba)));
@@ -817,7 +884,22 @@ impl eframe::App for HdrApp {
 
             ui.separator();
 
-            if self.is_generating {
+            if self.is_loading && self.total_loading > 0 {
+                let progress = self.loaded_count as f32 / self.total_loading as f32;
+                let progress_bar = egui::ProgressBar::new(progress).text(format!(
+                    "Loading {}/{}",
+                    self.loaded_count, self.total_loading
+                ));
+                ui.add(progress_bar);
+            } else if self.is_generating && self.progress_total > 0 {
+                let progress = self.progress_current as f32 / self.progress_total as f32;
+                let progress_bar = egui::ProgressBar::new(progress).text(format!(
+                    "{}: {:.0}%",
+                    self.progress_stage,
+                    progress * 100.0
+                ));
+                ui.add(progress_bar);
+            } else if self.is_generating {
                 ui.add(egui::Spinner::new());
             }
             ui.label(&self.status);

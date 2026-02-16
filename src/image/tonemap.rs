@@ -2,6 +2,7 @@ use crate::error::HdrError;
 use crate::image::merge::HdrImage;
 use image::{DynamicImage, ImageBuffer, Rgb, Rgba32FImage};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const LUMINANCE_R: f32 = 0.2126;
@@ -48,15 +49,27 @@ pub fn tonemap_hdr_arc(
     method: &str,
     settings: &TonemapSettings,
 ) -> Result<DynamicImage, HdrError> {
+    tonemap_hdr_arc_with_progress(hdr, method, settings, |_| {})
+}
+
+pub fn tonemap_hdr_arc_with_progress<F>(
+    hdr: Arc<HdrImage>,
+    method: &str,
+    settings: &TonemapSettings,
+    progress_callback: F,
+) -> Result<DynamicImage, HdrError>
+where
+    F: Fn(usize) + Send + Sync,
+{
     log::info!("Tonemapping HDR using {} method", method);
 
     let mut result = match method.to_lowercase().as_str() {
-        "reinhard" => tonemap_reinhard_arc(&hdr, settings),
-        "filmic" => tonemap_filmic_arc(&hdr, settings),
-        "gamma" => tonemap_gamma_arc(&hdr, settings),
+        "reinhard" => tonemap_reinhard_arc_with_progress(&hdr, settings, progress_callback),
+        "filmic" => tonemap_filmic_arc_with_progress(&hdr, settings, progress_callback),
+        "gamma" => tonemap_gamma_arc_with_progress(&hdr, settings, progress_callback),
         _ => {
             log::warn!("Unknown tonemap method '{}', using Reinhard", method);
-            tonemap_reinhard_arc(&hdr, settings)
+            tonemap_reinhard_arc_with_progress(&hdr, settings, progress_callback)
         }
     }?;
 
@@ -68,15 +81,25 @@ pub fn tonemap_hdr_arc(
     Ok(result)
 }
 
-fn tonemap_reinhard_arc(
+fn tonemap_reinhard_arc_with_progress<F>(
     hdr: &Arc<HdrImage>,
     settings: &TonemapSettings,
-) -> Result<DynamicImage, HdrError> {
+    progress_callback: F,
+) -> Result<DynamicImage, HdrError>
+where
+    F: Fn(usize) + Send + Sync,
+{
     let data = hdr.data.as_ref();
     let max_lum = calculate_luminance_stats_arc(data, hdr.width, hdr.height).1;
     let white = max_lum.powi(2);
 
-    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+    let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
+    let processed = Arc::new(AtomicUsize::new(0));
+    let last_reported = Arc::new(AtomicUsize::new(0));
+    let report_interval = (total_pixels / 100).max(1);
+    let progress_callback = Arc::new(progress_callback);
+
+    let processed_pixels: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
         .into_par_iter()
         .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
         .map(|(x, y)| {
@@ -118,25 +141,44 @@ fn tonemap_reinhard_arc(
                 (g.clamp(0.0, 1.0) * 255.0) as u8,
                 (b.clamp(0.0, 1.0) * 255.0) as u8,
             ]);
+
+            let count = processed.fetch_add(1, Ordering::Relaxed);
+            if count.saturating_sub(last_reported.load(Ordering::Relaxed)) >= report_interval {
+                last_reported.store(count, Ordering::Relaxed);
+                progress_callback(count);
+            }
+
             (x, y, rgb)
         })
         .collect();
 
+    progress_callback(total_pixels);
+
     let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
-    for (x, y, rgb) in processed {
+    for (x, y, rgb) in processed_pixels {
         output.put_pixel(x, y, rgb);
     }
 
     Ok(DynamicImage::ImageRgb8(output))
 }
 
-fn tonemap_filmic_arc(
+fn tonemap_filmic_arc_with_progress<F>(
     hdr: &Arc<HdrImage>,
     settings: &TonemapSettings,
-) -> Result<DynamicImage, HdrError> {
+    progress_callback: F,
+) -> Result<DynamicImage, HdrError>
+where
+    F: Fn(usize) + Send + Sync,
+{
     let data = hdr.data.as_ref();
 
-    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+    let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
+    let processed = Arc::new(AtomicUsize::new(0));
+    let last_reported = Arc::new(AtomicUsize::new(0));
+    let report_interval = (total_pixels / 100).max(1);
+    let progress_callback = Arc::new(progress_callback);
+
+    let processed_pixels: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
         .into_par_iter()
         .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
         .map(|(x, y)| {
@@ -168,26 +210,45 @@ fn tonemap_filmic_arc(
                 (g.clamp(0.0, 1.0) * 255.0) as u8,
                 (b.clamp(0.0, 1.0) * 255.0) as u8,
             ]);
+
+            let count = processed.fetch_add(1, Ordering::Relaxed);
+            if count.saturating_sub(last_reported.load(Ordering::Relaxed)) >= report_interval {
+                last_reported.store(count, Ordering::Relaxed);
+                progress_callback(count);
+            }
+
             (x, y, rgb)
         })
         .collect();
 
+    progress_callback(total_pixels);
+
     let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
-    for (x, y, rgb) in processed {
+    for (x, y, rgb) in processed_pixels {
         output.put_pixel(x, y, rgb);
     }
 
     Ok(DynamicImage::ImageRgb8(output))
 }
 
-fn tonemap_gamma_arc(
+fn tonemap_gamma_arc_with_progress<F>(
     hdr: &Arc<HdrImage>,
     settings: &TonemapSettings,
-) -> Result<DynamicImage, HdrError> {
+    progress_callback: F,
+) -> Result<DynamicImage, HdrError>
+where
+    F: Fn(usize) + Send + Sync,
+{
     let data = hdr.data.as_ref();
     let gamma = 1.0 / 2.2;
 
-    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+    let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
+    let processed = Arc::new(AtomicUsize::new(0));
+    let last_reported = Arc::new(AtomicUsize::new(0));
+    let report_interval = (total_pixels / 100).max(1);
+    let progress_callback = Arc::new(progress_callback);
+
+    let processed_pixels: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
         .into_par_iter()
         .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
         .map(|(x, y)| {
@@ -211,12 +272,21 @@ fn tonemap_gamma_arc(
                 (g.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
                 (b.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
             ]);
+
+            let count = processed.fetch_add(1, Ordering::Relaxed);
+            if count.saturating_sub(last_reported.load(Ordering::Relaxed)) >= report_interval {
+                last_reported.store(count, Ordering::Relaxed);
+                progress_callback(count);
+            }
+
             (x, y, rgb)
         })
         .collect();
 
+    progress_callback(total_pixels);
+
     let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
-    for (x, y, rgb) in processed {
+    for (x, y, rgb) in processed_pixels {
         output.put_pixel(x, y, rgb);
     }
 
