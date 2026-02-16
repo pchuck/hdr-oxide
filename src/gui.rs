@@ -26,6 +26,18 @@ pub struct HdrApp {
     pending_load_queue: Vec<PathBuf>,
     is_loading: bool,
     needs_hdr: bool,
+    settings_changed: bool,
+    last_tonemap_method: String,
+    last_exposure: f32,
+    last_contrast: f32,
+    last_saturation: f32,
+    last_vibrance: f32,
+    last_shadows: f32,
+    last_highlights: f32,
+    last_temperature: f32,
+    last_tint: f32,
+    last_hue_shift: f32,
+    last_sharpen: f32,
     hdr_image: Option<HdrImage>,
     preview_texture: Option<egui::TextureHandle>,
     tonemap_method: String,
@@ -57,6 +69,18 @@ impl Default for HdrApp {
             pending_load_queue: Vec::new(),
             is_loading: false,
             needs_hdr: false,
+            settings_changed: false,
+            last_tonemap_method: "reinhard".to_string(),
+            last_exposure: 1.0,
+            last_contrast: 1.0,
+            last_saturation: 1.0,
+            last_vibrance: 0.0,
+            last_shadows: 0.0,
+            last_highlights: 0.0,
+            last_temperature: 0.0,
+            last_tint: 0.0,
+            last_hue_shift: 0.0,
+            last_sharpen: 0.0,
             hdr_image: None,
             preview_texture: None,
             tonemap_method: "reinhard".to_string(),
@@ -109,6 +133,7 @@ impl HdrApp {
                     if !paths_to_load.is_empty() {
                         self.input_paths.extend(paths_to_load.clone());
                         self.needs_hdr = true;
+                        self.settings_changed = true;
                         self.status = format!(
                             "{} images (loading {} from pattern)",
                             self.input_paths.len(),
@@ -135,6 +160,7 @@ impl HdrApp {
                     if !self.input_paths.contains(&path) && !self.loading_paths.contains(&path) {
                         self.input_paths.push(path.clone());
                         self.needs_hdr = true;
+                        self.settings_changed = true;
                         self.status = format!("{} images (loading)", self.input_paths.len());
                         self.start_async_loading(vec![path]);
                     }
@@ -214,6 +240,35 @@ impl HdrApp {
 
     fn is_loading(&self) -> bool {
         !self.loading_paths.is_empty()
+    }
+
+    fn check_settings_changed(&mut self) {
+        self.settings_changed = self.tonemap_method != self.last_tonemap_method
+            || (self.exposure - self.last_exposure).abs() > 0.001
+            || (self.contrast - self.last_contrast).abs() > 0.001
+            || (self.saturation - self.last_saturation).abs() > 0.001
+            || (self.vibrance - self.last_vibrance).abs() > 0.1
+            || (self.shadows - self.last_shadows).abs() > 0.1
+            || (self.highlights - self.last_highlights).abs() > 0.1
+            || (self.temperature - self.last_temperature).abs() > 0.1
+            || (self.tint - self.last_tint).abs() > 0.1
+            || (self.hue_shift - self.last_hue_shift).abs() > 0.1
+            || (self.sharpen - self.last_sharpen).abs() > 0.1;
+    }
+
+    fn save_last_settings(&mut self) {
+        self.last_tonemap_method = self.tonemap_method.clone();
+        self.last_exposure = self.exposure;
+        self.last_contrast = self.contrast;
+        self.last_saturation = self.saturation;
+        self.last_vibrance = self.vibrance;
+        self.last_shadows = self.shadows;
+        self.last_highlights = self.highlights;
+        self.last_temperature = self.temperature;
+        self.last_tint = self.tint;
+        self.last_hue_shift = self.hue_shift;
+        self.last_sharpen = self.sharpen;
+        self.settings_changed = false;
     }
 
     fn clear_images(&mut self) {
@@ -340,6 +395,7 @@ impl HdrApp {
                     match result {
                         Ok(image) => {
                             self.apply_preview_texture(ctx, image);
+                            self.save_last_settings();
                         }
                         Err(e) => {
                             self.status = format!("Tonemap failed: {}", e);
@@ -461,7 +517,7 @@ impl HdrApp {
         }
 
         self.is_generating = true;
-        self.status = "Opening save dialog...".to_string();
+        self.status = "Saving HDR...".to_string();
 
         let hdr_clone = HdrImage {
             data: self.hdr_image.as_ref().unwrap().data.clone(),
@@ -626,6 +682,7 @@ impl eframe::App for HdrApp {
                         self.hdr_image = None;
                         self.preview_texture = None;
                         self.needs_hdr = true;
+                        self.settings_changed = true;
                     }
 
                     if ui.button("Clear All").clicked() {
@@ -659,15 +716,20 @@ impl eframe::App for HdrApp {
             ui.separator();
 
             ui.horizontal(|ui| {
-                if self.hdr_image.is_some() && !self.is_generating {
-                    if ui.button("Apply").clicked() {
-                        self.update_preview(ctx);
-                    }
+                let can_apply =
+                    self.hdr_image.is_some() && self.settings_changed && !self.is_generating;
+                if ui
+                    .add_enabled(can_apply, egui::Button::new("Apply"))
+                    .clicked()
+                {
+                    self.update_preview(ctx);
                 }
 
-                if ui.button("Save HDR").clicked()
-                    && self.hdr_image.is_some()
-                    && !self.is_generating
+                let can_save =
+                    self.hdr_image.is_some() && !self.settings_changed && !self.is_generating;
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Save HDR"))
+                    .clicked()
                 {
                     self.save_output();
                 }
@@ -686,8 +748,12 @@ impl eframe::App for HdrApp {
                     ui.selectable_value(&mut self.tonemap_method, "gamma".to_string(), "Gamma");
                 });
 
+            self.check_settings_changed();
+
             ui.add(egui::Slider::new(&mut self.exposure, 0.1..=10.0).text("Exposure"));
             ui.add(egui::Slider::new(&mut self.contrast, 0.0..=2.0).text("Contrast"));
+
+            self.check_settings_changed();
 
             ui.collapsing("Advanced Controls", |ui| {
                 ui.add(egui::Slider::new(&mut self.saturation, 0.0..=2.0).text("Saturation"));
