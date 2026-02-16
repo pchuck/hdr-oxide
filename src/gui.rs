@@ -23,6 +23,7 @@ pub enum GuiCommand {
         current: usize,
         total: usize,
     },
+    CompareTextureReady(egui::ColorImage),
 }
 
 pub struct HdrApp {
@@ -428,7 +429,7 @@ impl HdrApp {
     }
 
     fn check_results(&mut self, ctx: &egui::Context) {
-        if !self.is_loading && !self.is_generating {
+        if self.rx.is_none() {
             return;
         }
 
@@ -474,7 +475,8 @@ impl HdrApp {
                             self.apply_preview_texture(ctx, image);
                             self.save_last_settings();
                             if self.compare_mode {
-                                self.update_compare_texture(ctx);
+                                self.compare_texture = None;
+                                self.start_compare_texture_load();
                             }
                         }
                         Err(e) => {
@@ -529,6 +531,10 @@ impl HdrApp {
                     self.progress_stage = stage;
                     self.progress_current = current;
                     self.progress_total = total;
+                }
+                GuiCommand::CompareTextureReady(color_image) => {
+                    self.update_compare_texture(ctx, color_image);
+                    self.rx = None;
                 }
             }
         }
@@ -615,20 +621,32 @@ impl HdrApp {
         self.status = "Preview ready".to_string();
     }
 
-    fn toggle_compare_mode(&mut self, ctx: &egui::Context) {
+    fn toggle_compare_mode(&mut self, _ctx: &egui::Context) {
         self.compare_mode = !self.compare_mode;
         if self.compare_mode {
             self.compare_position = 0.5;
             self.compare_index = 0;
-            self.update_compare_texture(ctx);
+            self.compare_texture = None;
+            self.start_compare_texture_load();
         } else {
             self.compare_texture = None;
         }
     }
 
-    fn update_compare_texture(&mut self, ctx: &egui::Context) {
-        if self.compare_index < self.preloaded_images.len() {
-            let (_, img) = &self.preloaded_images[self.compare_index];
+    fn start_compare_texture_load(&mut self) {
+        if self.compare_index >= self.preloaded_images.len() {
+            return;
+        }
+
+        if self.rx.is_some() {
+            return;
+        }
+
+        let img = Arc::clone(&self.preloaded_images[self.compare_index].1);
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+
+        thread::spawn(move || {
             let size = img.dimensions();
             let rgba = img.to_rgba8();
             let pixels: Vec<egui::Color32> = rgba
@@ -639,12 +657,16 @@ impl HdrApp {
                 size: [size.0 as usize, size.1 as usize],
                 pixels,
             };
-            self.compare_texture = Some(ctx.load_texture(
-                "compare_source",
-                Arc::new(color_image),
-                egui::TextureOptions::LINEAR,
-            ));
-        }
+            let _ = tx.send(GuiCommand::CompareTextureReady(color_image));
+        });
+    }
+
+    fn update_compare_texture(&mut self, ctx: &egui::Context, color_image: egui::ColorImage) {
+        self.compare_texture = Some(ctx.load_texture(
+            "compare_source",
+            Arc::new(color_image),
+            egui::TextureOptions::LINEAR,
+        ));
     }
 
     fn save_output(&mut self) {
@@ -885,12 +907,17 @@ impl eframe::App for HdrApp {
                         } else {
                             self.compare_index - 1
                         };
-                        self.update_compare_texture(ctx);
+                        self.compare_texture = None;
+                        self.start_compare_texture_load();
                     }
                     ui.label(format!("{}/{}", self.compare_index + 1, num_images));
                     if ui.button("▶").clicked() {
                         self.compare_index = (self.compare_index + 1) % num_images;
-                        self.update_compare_texture(ctx);
+                        self.compare_texture = None;
+                        self.start_compare_texture_load();
+                    }
+                    if self.compare_texture.is_none() {
+                        ui.add(egui::Spinner::new().size(16.0));
                     }
                 });
             }
@@ -1110,7 +1137,7 @@ impl eframe::App for HdrApp {
             }
         });
 
-        if self.is_loading || self.is_generating {
+        if self.is_loading || self.is_generating || self.rx.is_some() {
             ctx.request_repaint();
         }
     }
