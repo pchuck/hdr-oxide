@@ -95,36 +95,47 @@ pub fn create_hdr(args: CreateArgs) -> Result<()> {
 }
 
 pub fn info_hdr(args: InfoArgs) -> Result<()> {
-    println!("HDR Image Information");
-    println!("=====================");
+    println!("Image Information");
+    println!("=================");
     println!("File: {:?}", args.input);
 
-    let hdr = merge::HdrImage::from_exr(&args.input)?;
-    println!("Dimensions: {} x {}", hdr.width, hdr.height);
-    println!("Format: 32-bit float RGBA TIFF");
+    // Check file exists
+    if !args.input.exists() {
+        return Err(HdrError::Io(format!("File not found: {:?}", args.input)).into());
+    }
 
-    if args.verbose {
-        let mut min_values = [f32::INFINITY; 3];
-        let mut max_values = [f32::NEG_INFINITY; 3];
-        let mut sum_values = [0.0f32; 3];
-        let pixel_count = (hdr.width * hdr.height) as f32;
+    // Get file metadata
+    let metadata = std::fs::metadata(&args.input)?;
+    println!("Size: {} bytes", metadata.len());
 
-        for pixel in hdr.data.pixels() {
-            for i in 0..3 {
-                min_values[i] = min_values[i].min(pixel[i]);
-                max_values[i] = max_values[i].max(pixel[i]);
-                sum_values[i] += pixel[i];
+    // Try to open with image crate
+    match image::open(&args.input) {
+        Ok(img) => {
+            let (width, height) = img.dimensions();
+            println!("Dimensions: {} x {}", width, height);
+
+            // Determine format
+            let format = match img {
+                image::DynamicImage::ImageRgb8(_) => "8-bit RGB",
+                image::DynamicImage::ImageRgba8(_) => "8-bit RGBA",
+                image::DynamicImage::ImageRgb16(_) => "16-bit RGB",
+                image::DynamicImage::ImageRgba16(_) => "16-bit RGBA",
+                image::DynamicImage::ImageRgb32F(_) => "32-bit float RGB",
+                image::DynamicImage::ImageRgba32F(_) => "32-bit float RGBA",
+                image::DynamicImage::ImageLuma8(_) => "8-bit Grayscale",
+                image::DynamicImage::ImageLumaA8(_) => "8-bit Grayscale+Alpha",
+                image::DynamicImage::ImageLuma16(_) => "16-bit Grayscale",
+                image::DynamicImage::ImageLumaA16(_) => "16-bit Grayscale+Alpha",
+                _ => "Unknown",
+            };
+            println!("Format: {}", format);
+
+            if args.verbose {
+                println!("\nNote: Detailed channel statistics not yet implemented");
             }
         }
-
-        println!("\nChannel Statistics:");
-        let channel_names = ['R', 'G', 'B'];
-        for (i, name) in channel_names.iter().enumerate() {
-            let avg = sum_values[i] / pixel_count;
-            println!(
-                "  {}: min={:.4}, max={:.4}, avg={:.4}",
-                name, min_values[i], max_values[i], avg
-            );
+        Err(e) => {
+            println!("Could not read image: {}", e);
         }
     }
 

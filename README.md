@@ -57,12 +57,6 @@ Launch the interactive GUI:
 hdr-oxide gui
 ```
 
-The GUI provides:
-- Visual thumbnail management
-- Real-time preview with adjustment controls
-- Advanced tone mapping controls
-- One-click HDR creation
-
 ### CLI Mode
 
 #### Basic Usage
@@ -193,6 +187,13 @@ cargo run -- gui
 
 ## How It Works
 
+### GUI Mode
+1. **Add Images**: Select images via file dialog or path input
+3. **Generate HDR**: From loaded images
+4. **Apply**: Tonemap settings and other image controls
+5. **Save**: Export as 32-bit float TIFF
+
+### CLI Mode
 1. **Image Loading**: Reads input images and extracts EXIF metadata for exposure times
 2. **Alignment** (optional, with `--features alignment`): Uses ORB feature detection + BFMatcher + homography to align misaligned images to the first exposure
 3. **HDR Merging**: Combines images using weighted luminance based on relative exposures with parallel processing

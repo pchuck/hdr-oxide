@@ -2,36 +2,33 @@ use crate::error::HdrError;
 use crate::image::merge::{merge_to_hdr_parallel, HdrImage};
 use crate::image::tonemap::{tonemap_hdr, TonemapSettings};
 use eframe::egui;
-use image::GenericImageView;
+use image::{DynamicImage, GenericImageView};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-const THUMBNAIL_SIZE: u32 = 80;
-
-pub struct Thumbnail {
-    pub path: PathBuf,
-    pub texture: egui::TextureHandle,
-}
+const PREVIEW_SIZE: u32 = 100;
 
 pub enum GuiCommand {
     MergeComplete(Result<HdrImage, String>),
     LoadError(String),
-    FilePickerComplete(Vec<PathBuf>),
     SaveComplete(Result<(), String>),
-    ThumbnailsComplete(Vec<(PathBuf, image::RgbaImage)>),
     PreviewComplete(Result<image::RgbaImage, String>),
+    ImageLoaded(PathBuf, DynamicImage),
 }
 
 pub struct HdrApp {
     input_paths: Vec<PathBuf>,
-    thumbnails: Vec<Thumbnail>,
-    pending_thumbnail_paths: Vec<PathBuf>,
+    preloaded_images: Vec<(PathBuf, DynamicImage)>,
+    preloaded_textures: std::collections::HashMap<PathBuf, egui::TextureHandle>,
+    loading_paths: Vec<PathBuf>,
+    pending_load_queue: Vec<PathBuf>,
+    is_loading: bool,
+    needs_hdr: bool,
     hdr_image: Option<HdrImage>,
     preview_texture: Option<egui::TextureHandle>,
     tonemap_method: String,
-    // Image adjustment controls
     exposure: f32,
     contrast: f32,
     saturation: f32,
@@ -43,10 +40,9 @@ pub struct HdrApp {
     hue_shift: f32,
     sharpen: f32,
     status: String,
-    is_processing: bool,
+    is_generating: bool,
     rx: Option<mpsc::Receiver<GuiCommand>>,
     path_input: String,
-    // About dialog
     show_about: bool,
     about_texture: Option<egui::TextureHandle>,
 }
@@ -55,8 +51,12 @@ impl Default for HdrApp {
     fn default() -> Self {
         Self {
             input_paths: Vec::new(),
-            thumbnails: Vec::new(),
-            pending_thumbnail_paths: Vec::new(),
+            preloaded_images: Vec::new(),
+            preloaded_textures: std::collections::HashMap::new(),
+            loading_paths: Vec::new(),
+            pending_load_queue: Vec::new(),
+            is_loading: false,
+            needs_hdr: false,
             hdr_image: None,
             preview_texture: None,
             tonemap_method: "reinhard".to_string(),
@@ -71,7 +71,7 @@ impl Default for HdrApp {
             hue_shift: 0.0,
             sharpen: 0.0,
             status: "Add images using 'Open Files' button".to_string(),
-            is_processing: false,
+            is_generating: false,
             rx: None,
             path_input: String::new(),
             show_about: false,
@@ -84,13 +84,11 @@ impl HdrApp {
     fn add_path(&mut self) {
         let input = &self.path_input;
 
-        // Check if input contains wildcards
         if input.contains('*') || input.contains('?') {
-            // Handle glob pattern
             match glob::glob(input) {
                 Ok(paths) => {
                     let valid_exts = ["jpg", "jpeg", "png", "tif", "tiff"];
-                    let mut added = 0;
+                    let mut paths_to_load = Vec::new();
 
                     for path in paths.flatten() {
                         if path.is_file() {
@@ -101,21 +99,22 @@ impl HdrApp {
                                 .to_lowercase();
                             if valid_exts.contains(&ext.as_str())
                                 && !self.input_paths.contains(&path)
+                                && !self.loading_paths.contains(&path)
                             {
-                                self.input_paths.push(path.clone());
-                                self.pending_thumbnail_paths.push(path);
-                                added += 1;
+                                paths_to_load.push(path.clone());
                             }
                         }
                     }
 
-                    if added > 0 {
+                    if !paths_to_load.is_empty() {
+                        self.input_paths.extend(paths_to_load.clone());
+                        self.needs_hdr = true;
                         self.status = format!(
-                            "{} images (added {} from pattern)",
+                            "{} images (loading {} from pattern)",
                             self.input_paths.len(),
-                            added
+                            paths_to_load.len()
                         );
-                        self.start_thumbnail_loading();
+                        self.start_async_loading(paths_to_load);
                     } else {
                         self.status = "No matching image files found".to_string();
                     }
@@ -125,7 +124,6 @@ impl HdrApp {
                 }
             }
         } else {
-            // Handle single file path
             let path = PathBuf::from(input);
             if path.exists() && path.is_file() {
                 let ext = path
@@ -134,11 +132,11 @@ impl HdrApp {
                     .unwrap_or("")
                     .to_lowercase();
                 if ["jpg", "jpeg", "png", "tif", "tiff"].contains(&ext.as_str()) {
-                    if !self.input_paths.contains(&path) {
+                    if !self.input_paths.contains(&path) && !self.loading_paths.contains(&path) {
                         self.input_paths.push(path.clone());
-                        self.status = format!("{} images", self.input_paths.len());
-                        self.pending_thumbnail_paths.push(path);
-                        self.start_thumbnail_loading();
+                        self.needs_hdr = true;
+                        self.status = format!("{} images (loading)", self.input_paths.len());
+                        self.start_async_loading(vec![path]);
                     }
                 } else {
                     self.status = "Not an image file".to_string();
@@ -152,7 +150,7 @@ impl HdrApp {
 
     fn add_multiple_paths(&mut self, paths: &[PathBuf]) {
         let valid_exts = ["jpg", "jpeg", "png", "tif", "tiff"];
-        let mut added = 0;
+        let mut paths_to_load = Vec::new();
 
         for path in paths {
             if path.exists() && path.is_file() {
@@ -161,104 +159,93 @@ impl HdrApp {
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                if valid_exts.contains(&ext.as_str()) && !self.input_paths.contains(path) {
-                    self.input_paths.push(path.clone());
-                    self.pending_thumbnail_paths.push(path.clone());
-                    added += 1;
+                if valid_exts.contains(&ext.as_str())
+                    && !self.input_paths.contains(path)
+                    && !self.loading_paths.contains(path)
+                {
+                    paths_to_load.push(path.clone());
                 }
             }
         }
 
-        if added > 0 {
-            self.status = format!("{} images (added {})", self.input_paths.len(), added);
-            // Don't start loading immediately if we're still processing the file picker
-            // The caller should trigger thumbnail loading after clearing the receiver
+        if !paths_to_load.is_empty() {
+            self.input_paths.extend(paths_to_load.clone());
+            self.needs_hdr = true;
+            self.status = format!("{} images (loading)", self.input_paths.len());
+            self.start_async_loading(paths_to_load);
         } else {
             self.status = "No valid image files selected".to_string();
         }
     }
 
-    fn start_thumbnail_loading(&mut self) {
-        if self.pending_thumbnail_paths.is_empty() {
+    fn start_async_loading(&mut self, paths: Vec<PathBuf>) {
+        if self.is_loading {
+            self.pending_load_queue.extend(paths);
             return;
         }
 
-        if self.rx.is_some() {
-            // Already processing something, don't start thumbnails yet
-            // They will be loaded when current operation completes
-            return;
-        }
-
-        self.load_thumbnails_async();
-    }
-
-    fn load_thumbnails_async(&mut self) {
-        if self.pending_thumbnail_paths.is_empty() {
-            return;
-        }
-
-        let paths_to_load = std::mem::take(&mut self.pending_thumbnail_paths);
+        self.is_loading = true;
+        self.loading_paths = paths.clone();
+        self.status = format!("{} images (loading)", self.input_paths.len());
 
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
 
         thread::spawn(move || {
-            let mut results = Vec::new();
-
-            for path in paths_to_load {
-                match load_thumbnail(&path) {
-                    Some(image) => {
-                        results.push((path, image));
+            for path in paths {
+                match image::open(&path) {
+                    Ok(img) => {
+                        let _ = tx.send(GuiCommand::ImageLoaded(path, img));
                     }
-                    None => {
-                        log::warn!("Failed to load thumbnail for {:?}", path);
+                    Err(e) => {
+                        let _ = tx.send(GuiCommand::LoadError(format!("Failed to load: {}", e)));
                     }
                 }
             }
-
-            let _ = tx.send(GuiCommand::ThumbnailsComplete(results));
         });
     }
 
-    fn remove_thumbnail(&mut self, path: &PathBuf) {
-        self.thumbnails.retain(|t| t.path != *path);
+    fn process_queued_loads(&mut self) {
+        if !self.pending_load_queue.is_empty() && !self.is_loading {
+            let paths = std::mem::take(&mut self.pending_load_queue);
+            self.start_async_loading(paths);
+        }
+    }
+
+    fn is_loading(&self) -> bool {
+        !self.loading_paths.is_empty()
     }
 
     fn clear_images(&mut self) {
         self.input_paths.clear();
-        self.thumbnails.clear();
-        self.pending_thumbnail_paths.clear();
+        self.preloaded_images.clear();
+        self.preloaded_textures.clear();
+        self.loading_paths.clear();
+        self.pending_load_queue.clear();
+        self.is_loading = false;
         self.hdr_image = None;
         self.preview_texture = None;
         self.status = "Cleared".to_string();
     }
 
     fn open_file_dialog(&mut self) {
-        if self.is_processing {
+        if self.is_generating {
             return;
         }
 
-        self.is_processing = true;
-        self.status = "Opening file dialog...".to_string();
+        let files = rfd::FileDialog::new()
+            .add_filter("Images", &["jpg", "jpeg", "png", "tif", "tiff"])
+            .set_title("Select Images for HDR")
+            .pick_files();
 
-        let (tx, rx) = mpsc::channel();
-        self.rx = Some(rx);
-
-        thread::spawn(move || {
-            let files = rfd::FileDialog::new()
-                .add_filter("Images", &["jpg", "jpeg", "png", "tif", "tiff"])
-                .set_title("Select Images for HDR")
-                .pick_files();
-
-            match files {
-                Some(paths) => {
-                    let _ = tx.send(GuiCommand::FilePickerComplete(paths));
-                }
-                None => {
-                    let _ = tx.send(GuiCommand::FilePickerComplete(Vec::new()));
-                }
+        match files {
+            Some(paths) if !paths.is_empty() => {
+                self.add_multiple_paths(&paths);
             }
-        });
+            _ => {
+                self.status = "No files selected".to_string();
+            }
+        }
     }
 
     fn start_merge(&mut self) {
@@ -267,35 +254,49 @@ impl HdrApp {
             return;
         }
 
-        let paths = self.input_paths.clone();
-        self.is_processing = true;
+        if self.preloaded_images.is_empty() {
+            self.status = "Images not loaded".to_string();
+            return;
+        }
+
+        let preloaded = self.preloaded_images.clone();
+
+        self.is_generating = true;
         self.status = "Processing...".to_string();
 
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
 
         thread::spawn(move || {
-            use crate::image::loader::load_source_images;
+            use crate::image::loader::{extract_exposure_time, SourceImage};
 
-            match load_source_images(&paths, None, None) {
-                Ok(images) => match merge_to_hdr_parallel(&images) {
-                    Ok(hdr) => {
-                        let _ = tx.send(GuiCommand::MergeComplete(Ok(hdr)));
+            let mut images = Vec::with_capacity(preloaded.len());
+
+            for (path, img) in preloaded {
+                let exposure = match extract_exposure_time(&path) {
+                    Ok(exp) => exp,
+                    Err(_) => {
+                        log::warn!("Could not read exposure from {:?}, assuming 1/125", path);
+                        1.0 / 125.0
                     }
-                    Err(e) => {
-                        let _ =
-                            tx.send(GuiCommand::MergeComplete(Err(format!("HDR failed: {}", e))));
-                    }
-                },
+                };
+
+                images.push(SourceImage::new(path, img, exposure));
+            }
+
+            match merge_to_hdr_parallel(&images) {
+                Ok(hdr) => {
+                    let _ = tx.send(GuiCommand::MergeComplete(Ok(hdr)));
+                }
                 Err(e) => {
-                    let _ = tx.send(GuiCommand::LoadError(format!("Load failed: {}", e)));
+                    let _ = tx.send(GuiCommand::MergeComplete(Err(format!("HDR failed: {}", e))));
                 }
             }
         });
     }
 
     fn check_results(&mut self, ctx: &egui::Context) {
-        if self.rx.is_none() {
+        if !self.is_loading && !self.is_generating {
             return;
         }
 
@@ -311,70 +312,29 @@ impl HdrApp {
                 GuiCommand::MergeComplete(Ok(hdr)) => {
                     self.hdr_image = Some(hdr);
                     self.status = "HDR ready".to_string();
-                    self.is_processing = false;
+                    self.is_generating = false;
+                    self.needs_hdr = false;
                     self.rx = None;
-                    // Note: update_preview is now async, so we pass ctx and it will handle itself
                     self.update_preview(ctx);
                 }
                 GuiCommand::MergeComplete(Err(e)) => {
                     self.status = e;
-                    self.is_processing = false;
+                    self.is_generating = false;
                     self.rx = None;
-                    self.start_thumbnail_loading();
                 }
                 GuiCommand::LoadError(e) => {
                     self.status = e;
-                    self.is_processing = false;
+                    self.is_generating = false;
+                    self.is_loading = false;
                     self.rx = None;
-                    self.start_thumbnail_loading();
-                }
-                GuiCommand::FilePickerComplete(paths) => {
-                    if !paths.is_empty() {
-                        self.add_multiple_paths(&paths);
-                    } else {
-                        self.status = "No files selected".to_string();
-                    }
-                    self.is_processing = false;
-                    self.rx = None;
-                    // Start loading thumbnails now that receiver is cleared
-                    self.start_thumbnail_loading();
                 }
                 GuiCommand::SaveComplete(result) => {
                     match result {
                         Ok(()) => self.status = "Saved successfully".to_string(),
                         Err(e) => self.status = format!("Save failed: {}", e),
                     }
-                    self.is_processing = false;
+                    self.is_generating = false;
                     self.rx = None;
-                    self.start_thumbnail_loading();
-                }
-                GuiCommand::ThumbnailsComplete(images) => {
-                    for (path, image) in images {
-                        let (width, height) = image.dimensions();
-                        let pixels: Vec<egui::Color32> = image
-                            .pixels()
-                            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
-                            .collect();
-
-                        let color_image = egui::ColorImage {
-                            size: [width as usize, height as usize],
-                            pixels,
-                        };
-
-                        let texture = ctx.load_texture(
-                            format!(
-                                "thumb_{}",
-                                path.file_name().unwrap_or_default().to_string_lossy()
-                            ),
-                            Arc::new(color_image),
-                            egui::TextureOptions::LINEAR,
-                        );
-
-                        self.thumbnails.push(Thumbnail { path, texture });
-                    }
-                    self.rx = None;
-                    // Check if there are more thumbnails pending (e.g., added while we were loading)
-                    self.start_thumbnail_loading();
                 }
                 GuiCommand::PreviewComplete(result) => {
                     match result {
@@ -385,20 +345,59 @@ impl HdrApp {
                             self.status = format!("Tonemap failed: {}", e);
                         }
                     }
-                    self.is_processing = false;
+                    self.is_generating = false;
                     self.rx = None;
-                    self.start_thumbnail_loading();
+                }
+                GuiCommand::ImageLoaded(path, img) => {
+                    self.loading_paths.retain(|p| *p != path);
+                    self.preloaded_images.push((path.clone(), img.clone()));
+
+                    let resized = img.resize(
+                        PREVIEW_SIZE,
+                        PREVIEW_SIZE,
+                        image::imageops::FilterType::Triangle,
+                    );
+                    let rgba = resized.to_rgba8();
+                    let (width, height) = rgba.dimensions();
+                    let pixels: Vec<egui::Color32> = rgba
+                        .pixels()
+                        .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+                        .collect();
+
+                    let color_image = egui::ColorImage {
+                        size: [width as usize, height as usize],
+                        pixels,
+                    };
+
+                    let texture = ctx.load_texture(
+                        format!(
+                            "img_{}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        Arc::new(color_image),
+                        egui::TextureOptions::LINEAR,
+                    );
+
+                    self.preloaded_textures.insert(path.clone(), texture);
+
+                    if self.loading_paths.is_empty() {
+                        self.status = format!("{} images ready", self.input_paths.len());
+                        self.is_generating = false;
+                        self.is_loading = false;
+                        self.rx = None;
+                        self.process_queued_loads();
+                    }
                 }
             }
         }
     }
 
     fn update_preview(&mut self, _ctx: &egui::Context) {
-        if self.hdr_image.is_none() || self.is_processing {
+        if self.hdr_image.is_none() || self.is_generating {
             return;
         }
 
-        self.is_processing = true;
+        self.is_generating = true;
         self.status = "Updating preview...".to_string();
 
         let hdr_clone = HdrImage {
@@ -457,11 +456,11 @@ impl HdrApp {
     }
 
     fn save_output(&mut self) {
-        if self.hdr_image.is_none() || self.is_processing {
+        if self.hdr_image.is_none() || self.is_generating {
             return;
         }
 
-        self.is_processing = true;
+        self.is_generating = true;
         self.status = "Opening save dialog...".to_string();
 
         let hdr_clone = HdrImage {
@@ -543,8 +542,10 @@ impl eframe::App for HdrApp {
 
             ui.collapsing("Source Images", |ui| {
                 ui.label("Add images:");
-                if ui.button("Open Files...").clicked() && !self.is_processing {
-                    self.open_file_dialog();
+                if ui.button("Open Files...").clicked() {
+                    if !self.is_generating {
+                        self.open_file_dialog();
+                    }
                 }
 
                 ui.separator();
@@ -559,7 +560,6 @@ impl eframe::App for HdrApp {
                     ui.separator();
                     ui.label(format!("{} images:", self.input_paths.len()));
 
-                    // Display thumbnails vertically, full width
                     let panel_width = ui.available_width();
                     let to_remove = egui::ScrollArea::vertical()
                         .max_height(300.0)
@@ -571,17 +571,16 @@ impl eframe::App for HdrApp {
                                 ui.vertical(|ui| {
                                     ui.set_width(panel_width);
 
-                                    // Thumbnail image - full panel width
-                                    if let Some(thumb) =
-                                        self.thumbnails.iter().find(|t| t.path == *path)
-                                    {
-                                        let size = thumb.texture.size();
+                                    let texture_found = self.preloaded_textures.get(path);
+
+                                    if let Some(texture) = texture_found {
+                                        let size = texture.size();
                                         let aspect = size[1] as f32 / size[0] as f32;
                                         let height = (panel_width - spacing * 2.0) * aspect;
-                                        let max_height = 120.0f32; // Cap height for very wide images
+                                        let max_height = 120.0f32;
                                         let final_height = height.min(max_height);
 
-                                        ui.add(egui::Image::new(&thumb.texture).fit_to_exact_size(
+                                        ui.add(egui::Image::new(texture).fit_to_exact_size(
                                             egui::vec2(panel_width - spacing * 2.0, final_height),
                                         ));
                                     } else {
@@ -591,7 +590,6 @@ impl eframe::App for HdrApp {
                                         );
                                     }
 
-                                    // Filename and remove button in one row
                                     ui.horizontal(|ui| {
                                         ui.set_width(panel_width - spacing * 2.0);
                                         let filename = path
@@ -622,9 +620,12 @@ impl eframe::App for HdrApp {
 
                     if let Some(idx) = to_remove.inner {
                         let path = self.input_paths.remove(idx);
-                        self.remove_thumbnail(&path);
+                        self.preloaded_images.retain(|(p, _)| *p != path);
+                        self.preloaded_textures.remove(&path);
+                        self.loading_paths.retain(|p| *p != path);
                         self.hdr_image = None;
                         self.preview_texture = None;
+                        self.needs_hdr = true;
                     }
 
                     if ui.button("Clear All").clicked() {
@@ -634,6 +635,43 @@ impl eframe::App for HdrApp {
             });
 
             ui.separator();
+
+            let can_create_hdr = self.needs_hdr
+                && !self.input_paths.is_empty()
+                && !self.is_generating
+                && !self.is_loading();
+
+            if ui
+                .add_enabled(can_create_hdr, egui::Button::new("Generate HDR"))
+                .clicked()
+            {
+                self.start_merge();
+            }
+
+            if self.is_loading() {
+                ui.label(egui::RichText::new("Loading images...").small());
+            }
+
+            if self.is_generating {
+                ui.label(egui::RichText::new("Generating HDR...").small());
+            }
+
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                if self.hdr_image.is_some() && !self.is_generating {
+                    if ui.button("Apply").clicked() {
+                        self.update_preview(ctx);
+                    }
+                }
+
+                if ui.button("Save HDR").clicked()
+                    && self.hdr_image.is_some()
+                    && !self.is_generating
+                {
+                    self.save_output();
+                }
+            });
 
             ui.label("Tonemap:");
             egui::ComboBox::from_label("Method")
@@ -651,7 +689,6 @@ impl eframe::App for HdrApp {
             ui.add(egui::Slider::new(&mut self.exposure, 0.1..=10.0).text("Exposure"));
             ui.add(egui::Slider::new(&mut self.contrast, 0.0..=2.0).text("Contrast"));
 
-            // Collapsible advanced controls
             ui.collapsing("Advanced Controls", |ui| {
                 ui.add(egui::Slider::new(&mut self.saturation, 0.0..=2.0).text("Saturation"));
                 ui.add(egui::Slider::new(&mut self.vibrance, -100.0..=100.0).text("Vibrance"));
@@ -671,29 +708,8 @@ impl eframe::App for HdrApp {
 
             ui.separator();
 
-            if self.hdr_image.is_some()
-                && !self.is_processing
-                && ui.button("Update Preview").clicked()
-            {
-                self.update_preview(ctx);
-            }
-
-            if ui.button("Create HDR").clicked()
-                && !self.input_paths.is_empty()
-                && !self.is_processing
-            {
-                self.start_merge();
-            }
-
-            if ui.button("Save").clicked() && self.hdr_image.is_some() && !self.is_processing {
-                self.save_output();
-            }
-
-            ui.separator();
-
             if ui.button("About").clicked() {
                 self.show_about = true;
-                // Load about image if not already loaded
                 if self.about_texture.is_none() {
                     if let Some(img) = load_about_image() {
                         let (width, height) = img.dimensions();
@@ -717,20 +733,18 @@ impl eframe::App for HdrApp {
 
             ui.separator();
 
-            if self.is_processing {
+            if self.is_generating {
                 ui.add(egui::Spinner::new());
             }
             ui.label(&self.status);
         });
 
-        // About dialog window
         if self.show_about {
             egui::Window::new("About HDR Oxide")
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
-                        // Show sample image if loaded
                         if let Some(ref texture) = self.about_texture {
                             let size = texture.size();
                             let max_width = 400.0;
@@ -773,28 +787,6 @@ impl eframe::App for HdrApp {
     }
 }
 
-fn load_thumbnail(path: &PathBuf) -> Option<image::RgbaImage> {
-    match image::open(path) {
-        Ok(img) => {
-            let (width, height) = img.dimensions();
-            let aspect = width as f32 / height as f32;
-
-            let (new_width, new_height) = if aspect > 1.0 {
-                (THUMBNAIL_SIZE, (THUMBNAIL_SIZE as f32 / aspect) as u32)
-            } else {
-                ((THUMBNAIL_SIZE as f32 * aspect) as u32, THUMBNAIL_SIZE)
-            };
-
-            let resized = img.resize(new_width, new_height, image::imageops::FilterType::Triangle);
-            Some(resized.to_rgba8())
-        }
-        Err(e) => {
-            log::error!("Failed to load image {:?}: {}", path, e);
-            None
-        }
-    }
-}
-
 fn load_about_image() -> Option<image::DynamicImage> {
     let about_path = std::path::PathBuf::from("resources/sample.png");
     match image::open(&about_path) {
@@ -807,6 +799,9 @@ fn load_about_image() -> Option<image::DynamicImage> {
 }
 
 pub fn run_gui() -> Result<(), HdrError> {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 700.0])

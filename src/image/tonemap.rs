@@ -412,9 +412,9 @@ fn apply_sharpen_blur(image: &DynamicImage, amount: f32) -> Result<DynamicImage,
             -amount,
             0.0,
         ];
-        let sharpened = image.clone();
-        filter3x3(&sharpened.to_rgb8(), &sharpen_kernel);
-        Ok(DynamicImage::ImageRgb8(sharpened.to_rgb8()))
+        let rgb_image = image.to_rgb8();
+        let sharpened = filter3x3(&rgb_image, &sharpen_kernel);
+        Ok(DynamicImage::ImageRgb8(sharpened))
     } else if amount < 0.0 {
         // Blur: Gaussian blur with strength based on amount
         let blur_amount = -amount * 2.0;
