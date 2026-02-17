@@ -59,7 +59,7 @@ pub fn tonemap_hdr_arc_with_progress<F>(
     progress_callback: F,
 ) -> Result<DynamicImage, HdrError>
 where
-    F: Fn(usize) + Send + Sync,
+    F: Fn(usize) + Send + Sync + 'static,
 {
     log::info!("Tonemapping HDR using {} method", method);
 
@@ -81,13 +81,53 @@ where
     Ok(result)
 }
 
+fn preprocess_pixel(r: f32, g: f32, b: f32, settings: &TonemapSettings) -> (f32, f32, f32) {
+    let r = r * settings.exposure;
+    let g = g * settings.exposure;
+    let b = b * settings.exposure;
+    apply_white_balance(r, g, b, settings.temperature, settings.tint)
+}
+
+fn postprocess_pixel(r: f32, g: f32, b: f32, settings: &TonemapSettings) -> Rgb<u8> {
+    let r = apply_contrast(r, settings.contrast);
+    let g = apply_contrast(g, settings.contrast);
+    let b = apply_contrast(b, settings.contrast);
+
+    let (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
+    let (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
+    let (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
+
+    let r = srgb_to_gamma(r);
+    let g = srgb_to_gamma(g);
+    let b = srgb_to_gamma(b);
+
+    Rgb([
+        (r.clamp(0.0, 1.0) * 255.0) as u8,
+        (g.clamp(0.0, 1.0) * 255.0) as u8,
+        (b.clamp(0.0, 1.0) * 255.0) as u8,
+    ])
+}
+
+fn report_progress(
+    count: usize,
+    _processed: &Arc<AtomicUsize>,
+    last_reported: &Arc<AtomicUsize>,
+    report_interval: usize,
+    progress_callback: &Arc<dyn Fn(usize) + Send + Sync>,
+) {
+    if count.saturating_sub(last_reported.load(Ordering::Relaxed)) >= report_interval {
+        last_reported.store(count, Ordering::Relaxed);
+        progress_callback(count);
+    }
+}
+
 fn tonemap_reinhard_arc_with_progress<F>(
     hdr: &Arc<HdrImage>,
     settings: &TonemapSettings,
     progress_callback: F,
 ) -> Result<DynamicImage, HdrError>
 where
-    F: Fn(usize) + Send + Sync,
+    F: Fn(usize) + Send + Sync + 'static,
 {
     let data = hdr.data.as_ref();
     let max_lum = calculate_luminance_stats_arc(data, hdr.width, hdr.height).1;
@@ -97,18 +137,14 @@ where
     let processed = Arc::new(AtomicUsize::new(0));
     let last_reported = Arc::new(AtomicUsize::new(0));
     let report_interval = (total_pixels / 100).max(1);
-    let progress_callback = Arc::new(progress_callback);
+    let progress_callback: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(progress_callback);
 
     let processed_pixels: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
         .into_par_iter()
         .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
         .map(|(x, y)| {
             let pixel = data.get_pixel(x, y);
-            let mut r = pixel[0] * settings.exposure;
-            let mut g = pixel[1] * settings.exposure;
-            let mut b = pixel[2] * settings.exposure;
-
-            (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
+            let (mut r, mut g, mut b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
             let lum = LUMINANCE_R * r + LUMINANCE_G * g + LUMINANCE_B * b;
             let lum_scaled = lum * (1.0 + lum / white) / (1.0 + lum);
@@ -124,29 +160,16 @@ where
             g = g / (g + 1.0);
             b = b / (b + 1.0);
 
-            r = apply_contrast(r, settings.contrast);
-            g = apply_contrast(g, settings.contrast);
-            b = apply_contrast(b, settings.contrast);
-
-            (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-            (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-            (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
-
-            r = srgb_to_gamma(r);
-            g = srgb_to_gamma(g);
-            b = srgb_to_gamma(b);
-
-            let rgb = Rgb([
-                (r.clamp(0.0, 1.0) * 255.0) as u8,
-                (g.clamp(0.0, 1.0) * 255.0) as u8,
-                (b.clamp(0.0, 1.0) * 255.0) as u8,
-            ]);
+            let rgb = postprocess_pixel(r, g, b, settings);
 
             let count = processed.fetch_add(1, Ordering::Relaxed);
-            if count.saturating_sub(last_reported.load(Ordering::Relaxed)) >= report_interval {
-                last_reported.store(count, Ordering::Relaxed);
-                progress_callback(count);
-            }
+            report_progress(
+                count,
+                &processed,
+                &last_reported,
+                report_interval,
+                &progress_callback,
+            );
 
             (x, y, rgb)
         })
@@ -168,7 +191,7 @@ fn tonemap_filmic_arc_with_progress<F>(
     progress_callback: F,
 ) -> Result<DynamicImage, HdrError>
 where
-    F: Fn(usize) + Send + Sync,
+    F: Fn(usize) + Send + Sync + 'static,
 {
     let data = hdr.data.as_ref();
 
@@ -176,46 +199,29 @@ where
     let processed = Arc::new(AtomicUsize::new(0));
     let last_reported = Arc::new(AtomicUsize::new(0));
     let report_interval = (total_pixels / 100).max(1);
-    let progress_callback = Arc::new(progress_callback);
+    let progress_callback: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(progress_callback);
 
     let processed_pixels: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
         .into_par_iter()
         .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
         .map(|(x, y)| {
             let pixel = data.get_pixel(x, y);
-            let mut r = pixel[0] * settings.exposure;
-            let mut g = pixel[1] * settings.exposure;
-            let mut b = pixel[2] * settings.exposure;
+            let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
-            (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
+            let r = apply_filmic_curve(r);
+            let g = apply_filmic_curve(g);
+            let b = apply_filmic_curve(b);
 
-            r = apply_filmic_curve(r);
-            g = apply_filmic_curve(g);
-            b = apply_filmic_curve(b);
-
-            r = apply_contrast(r, settings.contrast);
-            g = apply_contrast(g, settings.contrast);
-            b = apply_contrast(b, settings.contrast);
-
-            (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-            (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-            (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
-
-            r = srgb_to_gamma(r);
-            g = srgb_to_gamma(g);
-            b = srgb_to_gamma(b);
-
-            let rgb = Rgb([
-                (r.clamp(0.0, 1.0) * 255.0) as u8,
-                (g.clamp(0.0, 1.0) * 255.0) as u8,
-                (b.clamp(0.0, 1.0) * 255.0) as u8,
-            ]);
+            let rgb = postprocess_pixel(r, g, b, settings);
 
             let count = processed.fetch_add(1, Ordering::Relaxed);
-            if count.saturating_sub(last_reported.load(Ordering::Relaxed)) >= report_interval {
-                last_reported.store(count, Ordering::Relaxed);
-                progress_callback(count);
-            }
+            report_progress(
+                count,
+                &processed,
+                &last_reported,
+                report_interval,
+                &progress_callback,
+            );
 
             (x, y, rgb)
         })
@@ -237,47 +243,48 @@ fn tonemap_gamma_arc_with_progress<F>(
     progress_callback: F,
 ) -> Result<DynamicImage, HdrError>
 where
-    F: Fn(usize) + Send + Sync,
+    F: Fn(usize) + Send + Sync + 'static,
 {
     let data = hdr.data.as_ref();
-    let gamma = 1.0 / 2.2;
+    const GAMMA: f32 = 1.0 / 2.2;
 
     let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
     let processed = Arc::new(AtomicUsize::new(0));
     let last_reported = Arc::new(AtomicUsize::new(0));
     let report_interval = (total_pixels / 100).max(1);
-    let progress_callback = Arc::new(progress_callback);
+    let progress_callback: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(progress_callback);
 
     let processed_pixels: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
         .into_par_iter()
         .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
         .map(|(x, y)| {
             let pixel = data.get_pixel(x, y);
-            let mut r = pixel[0] * settings.exposure;
-            let mut g = pixel[1] * settings.exposure;
-            let mut b = pixel[2] * settings.exposure;
+            let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
-            (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
+            let r = apply_contrast(r, settings.contrast);
+            let g = apply_contrast(g, settings.contrast);
+            let b = apply_contrast(b, settings.contrast);
 
-            r = apply_contrast(r, settings.contrast);
-            g = apply_contrast(g, settings.contrast);
-            b = apply_contrast(b, settings.contrast);
-
-            (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-            (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-            (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
+            let (r, g, b) =
+                apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
+            let (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
+            let (r, g, b) =
+                apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
 
             let rgb = Rgb([
-                (r.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
-                (g.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
-                (b.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
+                (r.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
+                (g.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
+                (b.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
             ]);
 
             let count = processed.fetch_add(1, Ordering::Relaxed);
-            if count.saturating_sub(last_reported.load(Ordering::Relaxed)) >= report_interval {
-                last_reported.store(count, Ordering::Relaxed);
-                progress_callback(count);
-            }
+            report_progress(
+                count,
+                &processed,
+                &last_reported,
+                report_interval,
+                &progress_callback,
+            );
 
             (x, y, rgb)
         })
@@ -328,11 +335,7 @@ fn tonemap_reinhard(hdr: &HdrImage, settings: &TonemapSettings) -> Result<Dynami
         .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
         .map(|(x, y)| {
             let pixel = hdr.data.get_pixel(x, y);
-            let mut r = pixel[0] * settings.exposure;
-            let mut g = pixel[1] * settings.exposure;
-            let mut b = pixel[2] * settings.exposure;
-
-            (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
+            let (mut r, mut g, mut b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
             let lum = LUMINANCE_R * r + LUMINANCE_G * g + LUMINANCE_B * b;
             let lum_scaled = lum * (1.0 + lum / white) / (1.0 + lum);
@@ -348,23 +351,7 @@ fn tonemap_reinhard(hdr: &HdrImage, settings: &TonemapSettings) -> Result<Dynami
             g = g / (g + 1.0);
             b = b / (b + 1.0);
 
-            r = apply_contrast(r, settings.contrast);
-            g = apply_contrast(g, settings.contrast);
-            b = apply_contrast(b, settings.contrast);
-
-            (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-            (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-            (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
-
-            r = srgb_to_gamma(r);
-            g = srgb_to_gamma(g);
-            b = srgb_to_gamma(b);
-
-            let rgb = Rgb([
-                (r.clamp(0.0, 1.0) * 255.0) as u8,
-                (g.clamp(0.0, 1.0) * 255.0) as u8,
-                (b.clamp(0.0, 1.0) * 255.0) as u8,
-            ]);
+            let rgb = postprocess_pixel(r, g, b, settings);
             (x, y, rgb)
         })
         .collect();
@@ -383,33 +370,13 @@ fn tonemap_filmic(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicI
         .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
         .map(|(x, y)| {
             let pixel = hdr.data.get_pixel(x, y);
-            let mut r = pixel[0] * settings.exposure;
-            let mut g = pixel[1] * settings.exposure;
-            let mut b = pixel[2] * settings.exposure;
+            let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
-            (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
+            let r = apply_filmic_curve(r);
+            let g = apply_filmic_curve(g);
+            let b = apply_filmic_curve(b);
 
-            r = apply_filmic_curve(r);
-            g = apply_filmic_curve(g);
-            b = apply_filmic_curve(b);
-
-            r = apply_contrast(r, settings.contrast);
-            g = apply_contrast(g, settings.contrast);
-            b = apply_contrast(b, settings.contrast);
-
-            (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-            (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-            (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
-
-            r = srgb_to_gamma(r);
-            g = srgb_to_gamma(g);
-            b = srgb_to_gamma(b);
-
-            let rgb = Rgb([
-                (r.clamp(0.0, 1.0) * 255.0) as u8,
-                (g.clamp(0.0, 1.0) * 255.0) as u8,
-                (b.clamp(0.0, 1.0) * 255.0) as u8,
-            ]);
+            let rgb = postprocess_pixel(r, g, b, settings);
             (x, y, rgb)
         })
         .collect();
@@ -445,31 +412,29 @@ fn apply_filmic_curve(x: f32) -> f32 {
 }
 
 fn tonemap_gamma(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
-    let gamma = 1.0 / 2.2;
+    const GAMMA: f32 = 1.0 / 2.2;
 
     let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
         .into_par_iter()
         .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
         .map(|(x, y)| {
             let pixel = hdr.data.get_pixel(x, y);
-            let mut r = pixel[0] * settings.exposure;
-            let mut g = pixel[1] * settings.exposure;
-            let mut b = pixel[2] * settings.exposure;
+            let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
-            (r, g, b) = apply_white_balance(r, g, b, settings.temperature, settings.tint);
+            let r = apply_contrast(r, settings.contrast);
+            let g = apply_contrast(g, settings.contrast);
+            let b = apply_contrast(b, settings.contrast);
 
-            r = apply_contrast(r, settings.contrast);
-            g = apply_contrast(g, settings.contrast);
-            b = apply_contrast(b, settings.contrast);
-
-            (r, g, b) = apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-            (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-            (r, g, b) = apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
+            let (r, g, b) =
+                apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
+            let (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
+            let (r, g, b) =
+                apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
 
             let rgb = Rgb([
-                (r.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
-                (g.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
-                (b.clamp(0.0, 1.0).powf(gamma) * 255.0) as u8,
+                (r.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
+                (g.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
+                (b.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
             ]);
             (x, y, rgb)
         })

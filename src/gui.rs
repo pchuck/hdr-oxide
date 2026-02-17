@@ -619,7 +619,7 @@ impl HdrApp {
                 hdr_arc,
                 &tonemap_method,
                 &settings,
-                |count| {
+                move |count| {
                     let _ = tx_progress.send(GuiCommand::Progress {
                         stage: "Tonemapping".to_string(),
                         current: count,
@@ -780,23 +780,27 @@ impl HdrApp {
             let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
             let hdr_arc = Arc::new(hdr);
             let tx_progress2 = tx.clone();
-            let tonemapped =
-                match tonemap_hdr_arc_with_progress(hdr_arc, &tonemap_method, &settings, |count| {
+            let tonemapped = match tonemap_hdr_arc_with_progress(
+                hdr_arc,
+                &tonemap_method,
+                &settings,
+                move |count| {
                     let _ = tx_progress2.send(GuiCommand::Progress {
                         stage: "Tonemapping".to_string(),
                         current: count,
                         total: total_pixels,
                     });
-                }) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = tx.send(GuiCommand::SaveComplete(Err(format!(
-                            "Tonemap failed: {}",
-                            e
-                        ))));
-                        return;
-                    }
-                };
+                },
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tx.send(GuiCommand::SaveComplete(Err(format!(
+                        "Tonemap failed: {}",
+                        e
+                    ))));
+                    return;
+                }
+            };
 
             let _ = tx.send(GuiCommand::Progress {
                 stage: "Saving".to_string(),
