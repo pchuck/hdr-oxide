@@ -128,48 +128,58 @@ where
 {
     let data = hdr.data.as_ref();
     let white = hdr.max_luminance.powi(2);
+    let width = hdr.width;
+    let height = hdr.height;
 
-    let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
+    let total_pixels = (width as u64 * height as u64) as usize;
     let processed = Arc::new(AtomicUsize::new(0));
     let report_interval = (total_pixels / 100).max(1);
     let progress_callback: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(progress_callback);
 
-    let processed_pixels: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+    let row_data: Vec<Vec<u8>> = (0..height)
         .into_par_iter()
-        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let pixel = data.get_pixel(x, y);
-            let (mut r, mut g, mut b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
+        .map(|y| {
+            let mut row = Vec::with_capacity(width as usize * 3);
+            for x in 0..width {
+                let pixel = data.get_pixel(x, y);
+                let (mut r, mut g, mut b) =
+                    preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
-            let lum = LUMINANCE_R * r + LUMINANCE_G * g + LUMINANCE_B * b;
-            let lum_scaled = lum * (1.0 + lum / white) / (1.0 + lum);
+                let lum = LUMINANCE_R * r + LUMINANCE_G * g + LUMINANCE_B * b;
+                let lum_scaled = lum * (1.0 + lum / white) / (1.0 + lum);
 
-            if lum > 0.0 {
-                let scale = lum_scaled / lum;
-                r *= scale;
-                g *= scale;
-                b *= scale;
+                if lum > 0.0 {
+                    let scale = lum_scaled / lum;
+                    r *= scale;
+                    g *= scale;
+                    b *= scale;
+                }
+
+                r = r / (r + 1.0);
+                g = g / (g + 1.0);
+                b = b / (b + 1.0);
+
+                let rgb = postprocess_pixel(r, g, b, settings);
+                row.push(rgb[0]);
+                row.push(rgb[1]);
+                row.push(rgb[2]);
             }
 
-            r = r / (r + 1.0);
-            g = g / (g + 1.0);
-            b = b / (b + 1.0);
-
-            let rgb = postprocess_pixel(r, g, b, settings);
-
-            let count = processed.fetch_add(1, Ordering::Relaxed);
+            let count = processed.fetch_add(width as usize, Ordering::Relaxed);
             report_progress(count, report_interval, &progress_callback);
 
-            (x, y, rgb)
+            row
         })
         .collect();
 
     progress_callback(total_pixels);
 
-    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
-    for (x, y, rgb) in processed_pixels {
-        output.put_pixel(x, y, rgb);
+    let mut output_data = Vec::with_capacity(total_pixels * 3);
+    for row in row_data {
+        output_data.extend_from_slice(&row);
     }
+    let output = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(width, height, output_data)
+        .ok_or_else(|| HdrError::Tonemap("Failed to create image buffer".to_string()))?;
 
     Ok(DynamicImage::ImageRgb8(output))
 }
@@ -183,38 +193,47 @@ where
     F: Fn(usize) + Send + Sync + 'static,
 {
     let data = hdr.data.as_ref();
+    let width = hdr.width;
+    let height = hdr.height;
 
-    let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
+    let total_pixels = (width as u64 * height as u64) as usize;
     let processed = Arc::new(AtomicUsize::new(0));
     let report_interval = (total_pixels / 100).max(1);
     let progress_callback: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(progress_callback);
 
-    let processed_pixels: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+    let row_data: Vec<Vec<u8>> = (0..height)
         .into_par_iter()
-        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let pixel = data.get_pixel(x, y);
-            let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
+        .map(|y| {
+            let mut row = Vec::with_capacity(width as usize * 3);
+            for x in 0..width {
+                let pixel = data.get_pixel(x, y);
+                let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
-            let r = apply_filmic_curve(r);
-            let g = apply_filmic_curve(g);
-            let b = apply_filmic_curve(b);
+                let r = apply_filmic_curve(r);
+                let g = apply_filmic_curve(g);
+                let b = apply_filmic_curve(b);
 
-            let rgb = postprocess_pixel(r, g, b, settings);
+                let rgb = postprocess_pixel(r, g, b, settings);
+                row.push(rgb[0]);
+                row.push(rgb[1]);
+                row.push(rgb[2]);
+            }
 
-            let count = processed.fetch_add(1, Ordering::Relaxed);
+            let count = processed.fetch_add(width as usize, Ordering::Relaxed);
             report_progress(count, report_interval, &progress_callback);
 
-            (x, y, rgb)
+            row
         })
         .collect();
 
     progress_callback(total_pixels);
 
-    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
-    for (x, y, rgb) in processed_pixels {
-        output.put_pixel(x, y, rgb);
+    let mut output_data = Vec::with_capacity(total_pixels * 3);
+    for row in row_data {
+        output_data.extend_from_slice(&row);
     }
+    let output = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(width, height, output_data)
+        .ok_or_else(|| HdrError::Tonemap("Failed to create image buffer".to_string()))?;
 
     Ok(DynamicImage::ImageRgb8(output))
 }
@@ -228,49 +247,53 @@ where
     F: Fn(usize) + Send + Sync + 'static,
 {
     let data = hdr.data.as_ref();
+    let width = hdr.width;
+    let height = hdr.height;
     const GAMMA: f32 = 1.0 / 2.2;
 
-    let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
+    let total_pixels = (width as u64 * height as u64) as usize;
     let processed = Arc::new(AtomicUsize::new(0));
     let report_interval = (total_pixels / 100).max(1);
     let progress_callback: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(progress_callback);
 
-    let processed_pixels: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+    let row_data: Vec<Vec<u8>> = (0..height)
         .into_par_iter()
-        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let pixel = data.get_pixel(x, y);
-            let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
+        .map(|y| {
+            let mut row = Vec::with_capacity(width as usize * 3);
+            for x in 0..width {
+                let pixel = data.get_pixel(x, y);
+                let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
-            let r = apply_contrast(r, settings.contrast);
-            let g = apply_contrast(g, settings.contrast);
-            let b = apply_contrast(b, settings.contrast);
+                let r = apply_contrast(r, settings.contrast);
+                let g = apply_contrast(g, settings.contrast);
+                let b = apply_contrast(b, settings.contrast);
 
-            let (r, g, b) =
-                apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-            let (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-            let (r, g, b) =
-                apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
+                let (r, g, b) =
+                    apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
+                let (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
+                let (r, g, b) =
+                    apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
 
-            let rgb = Rgb([
-                (r.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
-                (g.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
-                (b.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
-            ]);
+                row.push((r.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8);
+                row.push((g.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8);
+                row.push((b.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8);
+            }
 
-            let count = processed.fetch_add(1, Ordering::Relaxed);
+            let count = processed.fetch_add(width as usize, Ordering::Relaxed);
             report_progress(count, report_interval, &progress_callback);
 
-            (x, y, rgb)
+            row
         })
         .collect();
 
     progress_callback(total_pixels);
 
-    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
-    for (x, y, rgb) in processed_pixels {
-        output.put_pixel(x, y, rgb);
+    let mut output_data = Vec::with_capacity(total_pixels * 3);
+    for row in row_data {
+        output_data.extend_from_slice(&row);
     }
+    let output = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(width, height, output_data)
+        .ok_or_else(|| HdrError::Tonemap("Failed to create image buffer".to_string()))?;
 
     Ok(DynamicImage::ImageRgb8(output))
 }
@@ -302,63 +325,87 @@ pub fn tonemap_hdr(
 }
 
 fn tonemap_reinhard(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
+    let data = hdr.data.as_ref();
     let white = hdr.max_luminance.powi(2);
+    let width = hdr.width;
+    let height = hdr.height;
 
-    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+    let row_data: Vec<Vec<u8>> = (0..height)
         .into_par_iter()
-        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let pixel = hdr.data.get_pixel(x, y);
-            let (mut r, mut g, mut b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
+        .map(|y| {
+            let mut row = Vec::with_capacity(width as usize * 3);
+            for x in 0..width {
+                let pixel = data.get_pixel(x, y);
+                let (mut r, mut g, mut b) =
+                    preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
-            let lum = LUMINANCE_R * r + LUMINANCE_G * g + LUMINANCE_B * b;
-            let lum_scaled = lum * (1.0 + lum / white) / (1.0 + lum);
+                let lum = LUMINANCE_R * r + LUMINANCE_G * g + LUMINANCE_B * b;
+                let lum_scaled = lum * (1.0 + lum / white) / (1.0 + lum);
 
-            if lum > 0.0 {
-                let scale = lum_scaled / lum;
-                r *= scale;
-                g *= scale;
-                b *= scale;
+                if lum > 0.0 {
+                    let scale = lum_scaled / lum;
+                    r *= scale;
+                    g *= scale;
+                    b *= scale;
+                }
+
+                r = r / (r + 1.0);
+                g = g / (g + 1.0);
+                b = b / (b + 1.0);
+
+                let rgb = postprocess_pixel(r, g, b, settings);
+                row.push(rgb[0]);
+                row.push(rgb[1]);
+                row.push(rgb[2]);
             }
-
-            r = r / (r + 1.0);
-            g = g / (g + 1.0);
-            b = b / (b + 1.0);
-
-            let rgb = postprocess_pixel(r, g, b, settings);
-            (x, y, rgb)
+            row
         })
         .collect();
 
-    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
-    for (x, y, rgb) in processed {
-        output.put_pixel(x, y, rgb);
+    let total_pixels = (width as u64 * height as u64) as usize;
+    let mut output_data = Vec::with_capacity(total_pixels * 3);
+    for row in row_data {
+        output_data.extend_from_slice(&row);
     }
+    let output = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(width, height, output_data)
+        .ok_or_else(|| HdrError::Tonemap("Failed to create image buffer".to_string()))?;
 
     Ok(DynamicImage::ImageRgb8(output))
 }
 
 fn tonemap_filmic(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
-    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+    let data = hdr.data.as_ref();
+    let width = hdr.width;
+    let height = hdr.height;
+
+    let row_data: Vec<Vec<u8>> = (0..height)
         .into_par_iter()
-        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let pixel = hdr.data.get_pixel(x, y);
-            let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
+        .map(|y| {
+            let mut row = Vec::with_capacity(width as usize * 3);
+            for x in 0..width {
+                let pixel = data.get_pixel(x, y);
+                let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
-            let r = apply_filmic_curve(r);
-            let g = apply_filmic_curve(g);
-            let b = apply_filmic_curve(b);
+                let r = apply_filmic_curve(r);
+                let g = apply_filmic_curve(g);
+                let b = apply_filmic_curve(b);
 
-            let rgb = postprocess_pixel(r, g, b, settings);
-            (x, y, rgb)
+                let rgb = postprocess_pixel(r, g, b, settings);
+                row.push(rgb[0]);
+                row.push(rgb[1]);
+                row.push(rgb[2]);
+            }
+            row
         })
         .collect();
 
-    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
-    for (x, y, rgb) in processed {
-        output.put_pixel(x, y, rgb);
+    let total_pixels = (width as u64 * height as u64) as usize;
+    let mut output_data = Vec::with_capacity(total_pixels * 3);
+    for row in row_data {
+        output_data.extend_from_slice(&row);
     }
+    let output = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(width, height, output_data)
+        .ok_or_else(|| HdrError::Tonemap("Failed to create image buffer".to_string()))?;
 
     Ok(DynamicImage::ImageRgb8(output))
 }
@@ -386,38 +433,44 @@ fn apply_filmic_curve(x: f32) -> f32 {
 }
 
 fn tonemap_gamma(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
+    let data = hdr.data.as_ref();
+    let width = hdr.width;
+    let height = hdr.height;
     const GAMMA: f32 = 1.0 / 2.2;
 
-    let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
+    let row_data: Vec<Vec<u8>> = (0..height)
         .into_par_iter()
-        .flat_map(|y| (0..hdr.width).into_par_iter().map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let pixel = hdr.data.get_pixel(x, y);
-            let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
+        .map(|y| {
+            let mut row = Vec::with_capacity(width as usize * 3);
+            for x in 0..width {
+                let pixel = data.get_pixel(x, y);
+                let (r, g, b) = preprocess_pixel(pixel[0], pixel[1], pixel[2], settings);
 
-            let r = apply_contrast(r, settings.contrast);
-            let g = apply_contrast(g, settings.contrast);
-            let b = apply_contrast(b, settings.contrast);
+                let r = apply_contrast(r, settings.contrast);
+                let g = apply_contrast(g, settings.contrast);
+                let b = apply_contrast(b, settings.contrast);
 
-            let (r, g, b) =
-                apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
-            let (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
-            let (r, g, b) =
-                apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
+                let (r, g, b) =
+                    apply_shadows_highlights(r, g, b, settings.shadows, settings.highlights);
+                let (r, g, b) = apply_hue_shift(r, g, b, settings.hue_shift);
+                let (r, g, b) =
+                    apply_saturation_vibrance(r, g, b, settings.saturation, settings.vibrance);
 
-            let rgb = Rgb([
-                (r.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
-                (g.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
-                (b.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8,
-            ]);
-            (x, y, rgb)
+                row.push((r.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8);
+                row.push((g.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8);
+                row.push((b.clamp(0.0, 1.0).powf(GAMMA) * 255.0) as u8);
+            }
+            row
         })
         .collect();
 
-    let mut output: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(hdr.width, hdr.height);
-    for (x, y, rgb) in processed {
-        output.put_pixel(x, y, rgb);
+    let total_pixels = (width as u64 * height as u64) as usize;
+    let mut output_data = Vec::with_capacity(total_pixels * 3);
+    for row in row_data {
+        output_data.extend_from_slice(&row);
     }
+    let output = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_raw(width, height, output_data)
+        .ok_or_else(|| HdrError::Tonemap("Failed to create image buffer".to_string()))?;
 
     Ok(DynamicImage::ImageRgb8(output))
 }

@@ -87,7 +87,8 @@ pub fn merge_to_hdr(images: &[SourceImage]) -> std::result::Result<HdrImage, Hdr
     let img_data: Vec<image::Rgb32FImage> =
         images.iter().map(|img| img.image.to_rgb32f()).collect();
 
-    let mut hdr_data: Rgba32FImage = ImageBuffer::new(width, height);
+    let total_pixels = (width as u64 * height as u64) as usize;
+    let mut hdr_data_vec = Vec::with_capacity(total_pixels * 4);
 
     for y in 0..height {
         for x in 0..width {
@@ -126,12 +127,17 @@ pub fn merge_to_hdr(images: &[SourceImage]) -> std::result::Result<HdrImage, Hdr
                 (0.0f32, 0.0f32, 0.0f32)
             };
 
-            hdr_data.put_pixel(x, y, Rgba([r, g, b, 1.0]));
+            hdr_data_vec.push(r);
+            hdr_data_vec.push(g);
+            hdr_data_vec.push(b);
+            hdr_data_vec.push(1.0);
         }
     }
 
     log::info!("HDR merge complete");
 
+    let hdr_data: Rgba32FImage = ImageBuffer::from_raw(width, height, hdr_data_vec)
+        .expect("Failed to create HDR image buffer");
     let max_lum = HdrImage::calculate_max_luminance(&hdr_data);
     Ok(HdrImage {
         data: Arc::new(hdr_data),
@@ -193,60 +199,69 @@ where
 
     let exposures: Vec<f32> = images.iter().map(|i| i.exposure_seconds).collect();
 
-    let mut hdr_data: Rgba32FImage = ImageBuffer::new(width, height);
-    let total_pixels = height as usize;
+    let total_pixels = (width as u64 * height as u64) as usize;
     let processed = Arc::new(AtomicUsize::new(0));
+    let report_interval = (total_pixels / 100).max(1);
     let progress_callback = Arc::new(progress_callback);
 
-    let results: Vec<(u32, u32, f32, f32, f32)> = (0..height)
+    let row_data: Vec<Vec<f32>> = (0..height)
         .into_par_iter()
-        .flat_map(|y| (0..width).into_par_iter().map(move |x| (x, y)))
-        .map(|(x, y)| {
-            let mut r_sum = 0.0f32;
-            let mut g_sum = 0.0f32;
-            let mut b_sum = 0.0f32;
-            let mut weight_sum = 0.0f32;
+        .map(|y| {
+            let mut row = Vec::with_capacity(width as usize * 4);
+            for x in 0..width {
+                let mut r_sum = 0.0f32;
+                let mut g_sum = 0.0f32;
+                let mut b_sum = 0.0f32;
+                let mut weight_sum = 0.0f32;
 
-            for (img_idx, rgb) in img_data.iter().enumerate() {
-                let pixel = rgb.get_pixel(x, y);
+                for (img_idx, rgb) in img_data.iter().enumerate() {
+                    let pixel = rgb.get_pixel(x, y);
 
-                let orig_r = pixel[0];
-                let orig_g = pixel[1];
-                let orig_b = pixel[2];
+                    let orig_r = pixel[0];
+                    let orig_g = pixel[1];
+                    let orig_b = pixel[2];
 
-                let r = orig_r / exposures[img_idx];
-                let g = orig_g / exposures[img_idx];
-                let b = orig_b / exposures[img_idx];
+                    let r = orig_r / exposures[img_idx];
+                    let g = orig_g / exposures[img_idx];
+                    let b = orig_b / exposures[img_idx];
 
-                let weight = calculate_weight(orig_r, orig_g, orig_b);
+                    let weight = calculate_weight(orig_r, orig_g, orig_b);
 
-                r_sum += r * weight;
-                g_sum += g * weight;
-                b_sum += b * weight;
-                weight_sum += weight;
+                    r_sum += r * weight;
+                    g_sum += g * weight;
+                    b_sum += b * weight;
+                    weight_sum += weight;
+                }
+
+                let (r, g, b) = if weight_sum > 0.0 {
+                    (r_sum / weight_sum, g_sum / weight_sum, b_sum / weight_sum)
+                } else {
+                    (0.0f32, 0.0f32, 0.0f32)
+                };
+
+                row.push(r);
+                row.push(g);
+                row.push(b);
+                row.push(1.0);
             }
 
-            let (r, g, b) = if weight_sum > 0.0 {
-                (r_sum / weight_sum, g_sum / weight_sum, b_sum / weight_sum)
-            } else {
-                (0.0f32, 0.0f32, 0.0f32)
-            };
-
-            let count = processed.fetch_add(1, Ordering::Relaxed);
-            let report_interval = (total_pixels / 100).max(1);
+            let count = processed.fetch_add(width as usize, Ordering::Relaxed);
             if count % report_interval == 0 {
                 progress_callback(count);
             }
 
-            (x, y, r, g, b)
+            row
         })
         .collect();
 
     progress_callback(total_pixels);
 
-    for (x, y, r, g, b) in results {
-        hdr_data.put_pixel(x, y, Rgba([r, g, b, 1.0]));
+    let mut hdr_data_vec = Vec::with_capacity(total_pixels * 4);
+    for row in row_data {
+        hdr_data_vec.extend_from_slice(&row);
     }
+    let hdr_data: Rgba32FImage = ImageBuffer::from_raw(width, height, hdr_data_vec)
+        .expect("Failed to create HDR image buffer");
 
     log::info!("HDR merge complete (parallel)");
 
