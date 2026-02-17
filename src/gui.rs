@@ -174,7 +174,7 @@ impl HdrApp {
         if input.contains('*') || input.contains('?') {
             match glob::glob(input) {
                 Ok(paths) => {
-                    let valid_exts = ["jpg", "jpeg", "png", "tif", "tiff"];
+                    let valid_exts = ["jpg", "jpeg", "png", "tif", "tiff", "exr"];
                     let mut paths_to_load = Vec::new();
 
                     for path in paths.flatten() {
@@ -238,7 +238,7 @@ impl HdrApp {
     }
 
     fn add_multiple_paths(&mut self, paths: &[PathBuf]) {
-        let valid_exts = ["jpg", "jpeg", "png", "tif", "tiff"];
+        let valid_exts = ["jpg", "jpeg", "png", "tif", "tiff", "exr"];
         let mut paths_to_load = Vec::new();
 
         for path in paths {
@@ -407,7 +407,7 @@ impl HdrApp {
 
         thread::spawn(move || {
             let files = rfd::FileDialog::new()
-                .add_filter("Images", &["jpg", "jpeg", "png", "tif", "tiff"])
+                .add_filter("Images", &["jpg", "jpeg", "png", "tif", "tiff", "exr"])
                 .set_title("Select Images for HDR")
                 .pick_files();
 
@@ -752,18 +752,25 @@ impl HdrApp {
         thread::spawn(move || -> () {
             use crate::image::loader::SourceImage;
 
+            let tx_progress = tx.clone();
+            let _ = tx_progress.send(GuiCommand::Progress {
+                stage: "Merging full-res HDR".to_string(),
+                current: 0,
+                total: 1,
+            });
+
             let mut images = Vec::with_capacity(preloaded.len());
             for (path, img, exposure) in preloaded {
                 images.push(SourceImage::new(path, (*img).clone(), exposure));
             }
 
-            let tx_progress = tx.clone();
+            let total_pixels = images[0].width as usize * images[0].height as usize;
             let hdr_result =
                 crate::image::merge::merge_to_hdr_parallel_with_progress(&images, |count| {
                     let _ = tx_progress.send(GuiCommand::Progress {
                         stage: "Merging full-res HDR".to_string(),
                         current: count,
-                        total: images[0].width as usize * images[0].height as usize,
+                        total: total_pixels,
                     });
                 });
 
@@ -785,6 +792,7 @@ impl HdrApp {
             });
 
             let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
+            let hdr_for_exr = hdr.clone();
             let hdr_arc = Arc::new(hdr);
             let tx_progress2 = tx.clone();
             let tonemapped = match tonemap_hdr_arc_with_progress(
@@ -811,26 +819,53 @@ impl HdrApp {
 
             let _ = tx.send(GuiCommand::Progress {
                 stage: "Saving".to_string(),
-                current: 1,
-                total: 1,
+                current: 0,
+                total: 100,
             });
 
             let file = rfd::FileDialog::new()
                 .add_filter("PNG", &["png"])
                 .add_filter("JPEG", &["jpg", "jpeg"])
+                .add_filter("EXR (HDR)", &["exr"])
                 .set_title("Save HDR")
                 .set_file_name("hdr_output.png")
                 .save_file();
 
             match file {
-                Some(path) => match tonemapped.save(&path) {
-                    Ok(()) => {
-                        let _ = tx.send(GuiCommand::SaveComplete(Ok(())));
+                Some(path) => {
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+
+                    let result: std::result::Result<(), String> = if ext == "exr" {
+                        let total_pixels = hdr_for_exr.width as usize * hdr_for_exr.height as usize;
+                        let tx_progress = tx.clone();
+                        hdr_for_exr
+                            .save_exr_with_progress(&path, |completed| {
+                                let _ = tx_progress.send(GuiCommand::Progress {
+                                    stage: "Saving".to_string(),
+                                    current: completed,
+                                    total: total_pixels,
+                                });
+                            })
+                            .map_err(|e: crate::error::HdrError| e.to_string())
+                    } else {
+                        tonemapped
+                            .save(&path)
+                            .map_err(|e: image::ImageError| e.to_string())
+                    };
+
+                    match result {
+                        Ok(()) => {
+                            let _ = tx.send(GuiCommand::SaveComplete(Ok(())));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(GuiCommand::SaveComplete(Err(e.to_string())));
+                        }
                     }
-                    Err(e) => {
-                        let _ = tx.send(GuiCommand::SaveComplete(Err(e.to_string())));
-                    }
-                },
+                }
                 None => {
                     let _ = tx.send(GuiCommand::SaveComplete(
                         Err("No file selected".to_string()),

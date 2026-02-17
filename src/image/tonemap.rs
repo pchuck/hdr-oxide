@@ -114,7 +114,7 @@ fn report_progress(
     report_interval: usize,
     progress_callback: &Arc<dyn Fn(usize) + Send + Sync>,
 ) {
-    if count % report_interval == 0 {
+    if count.is_multiple_of(report_interval) {
         progress_callback(count);
     }
 }

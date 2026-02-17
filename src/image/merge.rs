@@ -1,10 +1,11 @@
 use crate::error::HdrError;
 use crate::image::loader::SourceImage;
-use image::{ImageBuffer, Rgba, Rgba32FImage};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba, Rgba32FImage};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[derive(Clone, Debug)]
 pub struct HdrImage {
     pub data: Arc<Rgba32FImage>,
     pub width: u32,
@@ -23,8 +24,30 @@ impl HdrImage {
         }
     }
 
-    pub fn from_exr(_path: &std::path::Path) -> std::result::Result<Self, HdrError> {
-        Err(HdrError::Exr("EXR reading not yet implemented".to_string()))
+    pub fn from_exr(path: &std::path::Path) -> std::result::Result<Self, HdrError> {
+        let img =
+            image::open(path).map_err(|e| HdrError::Exr(format!("Failed to read EXR: {}", e)))?;
+
+        let (width, height) = img.dimensions();
+
+        let rgba_img = img.to_rgba32f();
+        let mut data: Rgba32FImage = ImageBuffer::new(width, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = rgba_img.get_pixel(x, y);
+                data.put_pixel(x, y, Rgba([pixel[0], pixel[1], pixel[2], pixel[3]]));
+            }
+        }
+
+        let max_lum = HdrImage::calculate_max_luminance(&data);
+
+        Ok(Self {
+            data: Arc::new(data),
+            width,
+            height,
+            max_luminance: max_lum,
+        })
     }
 
     fn calculate_max_luminance(data: &Rgba32FImage) -> f32 {
@@ -34,6 +57,32 @@ impl HdrImage {
             max_lum = max_lum.max(lum);
         }
         max_lum
+    }
+
+    pub fn save_exr(&self, path: &std::path::Path) -> std::result::Result<(), HdrError> {
+        self.save_exr_with_progress(path, |_| {})
+    }
+
+    pub fn save_exr_with_progress<F>(
+        &self,
+        path: &std::path::Path,
+        progress_callback: F,
+    ) -> std::result::Result<(), HdrError>
+    where
+        F: Fn(usize) + Send + Sync,
+    {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let total_pixels = width * height;
+
+        progress_callback(0);
+
+        let img = DynamicImage::ImageRgba32F(self.data.as_ref().clone());
+        img.save_with_format(path, image::ImageFormat::OpenExr)
+            .map_err(|e| HdrError::Exr(format!("Failed to save EXR: {}", e)))?;
+
+        progress_callback(total_pixels);
+        Ok(())
     }
 }
 
@@ -246,7 +295,7 @@ where
             }
 
             let count = processed.fetch_add(width as usize, Ordering::Relaxed);
-            if count % report_interval == 0 {
+            if count.is_multiple_of(report_interval) {
                 progress_callback(count);
             }
 
