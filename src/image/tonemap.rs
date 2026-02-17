@@ -13,6 +13,7 @@ const SRGB_LINEAR_FACTOR: f32 = 12.92;
 const SRGB_GAMMA_FACTOR: f32 = 1.055;
 const SRGB_GAMMA_EXPONENT: f32 = 1.0 / 2.4;
 const SRGB_GAMMA_OFFSET: f32 = 0.055;
+const SHARPEN_THRESHOLD: f32 = 0.01;
 
 pub struct TonemapSettings {
     pub exposure: f32,
@@ -73,7 +74,7 @@ where
         }
     }?;
 
-    if settings.sharpen.abs() > 0.01 {
+    if settings.sharpen.abs() > SHARPEN_THRESHOLD {
         result = apply_sharpen_blur(&result, settings.sharpen)?;
     }
 
@@ -316,7 +317,7 @@ pub fn tonemap_hdr(
     }?;
 
     // Apply sharpening/blur if needed
-    if settings.sharpen.abs() > 0.01 {
+    if settings.sharpen.abs() > SHARPEN_THRESHOLD {
         result = apply_sharpen_blur(&result, settings.sharpen)?;
     }
 

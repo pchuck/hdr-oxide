@@ -1,4 +1,5 @@
 use crate::error::HdrError;
+use crate::image::histogram::Histogram;
 use crate::image::merge::HdrImage;
 use crate::image::tonemap::{tonemap_hdr_arc_with_progress, TonemapSettings};
 use eframe::egui;
@@ -105,6 +106,8 @@ pub struct HdrApp {
     compare_position: f32,
     compare_index: usize,
     compare_texture: Option<egui::TextureHandle>,
+    histogram: Histogram,
+    show_histogram: bool,
 }
 
 impl Default for HdrApp {
@@ -158,6 +161,8 @@ impl Default for HdrApp {
             compare_position: 0.5,
             compare_index: 0,
             compare_texture: None,
+            histogram: Histogram::new(),
+            show_histogram: false,
         }
     }
 }
@@ -513,6 +518,8 @@ impl HdrApp {
                     self.rx = None;
                     match result {
                         Ok(image) => {
+                            self.histogram =
+                                Histogram::compute(&DynamicImage::ImageRgba8(image.clone()));
                             self.apply_preview_texture(ctx, image);
                             self.save_last_settings();
                             if self.compare_mode {
@@ -954,25 +961,36 @@ impl eframe::App for HdrApp {
 
             ui.separator();
 
-            let can_create_hdr = self.needs_hdr
-                && !self.input_paths.is_empty()
-                && !self.is_generating
-                && !self.is_loading();
+            ui.horizontal(|ui| {
+                let can_create_hdr = self.needs_hdr
+                    && !self.input_paths.is_empty()
+                    && !self.is_generating
+                    && !self.is_loading();
 
-            if ui
-                .add_enabled(can_create_hdr, egui::Button::new("Generate HDR"))
-                .clicked()
-            {
-                self.start_merge();
-            }
+                if ui
+                    .add_enabled(can_create_hdr, egui::Button::new("Generate HDR"))
+                    .clicked()
+                {
+                    self.start_merge();
+                }
 
-            if self.is_loading() {
-                ui.label(egui::RichText::new("Loading images...").small());
-            }
+                let can_save =
+                    self.hdr_image.is_some() && !self.settings_changed && !self.is_generating;
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Save HDR"))
+                    .clicked()
+                {
+                    self.save_output();
+                }
 
-            if self.is_generating {
-                ui.label(egui::RichText::new("Generating HDR...").small());
-            }
+                if self.is_loading() {
+                    ui.label(egui::RichText::new("Loading images...").small());
+                }
+
+                if self.is_generating {
+                    ui.label(egui::RichText::new("Generating HDR...").small());
+                }
+            });
 
             ui.separator();
 
@@ -986,23 +1004,23 @@ impl eframe::App for HdrApp {
                     self.update_preview(ctx);
                 }
 
-                let can_save =
-                    self.hdr_image.is_some() && !self.settings_changed && !self.is_generating;
+                let can_compare =
+                    self.preview_texture.is_some() && !self.preloaded_images.is_empty();
                 if ui
-                    .add_enabled(can_save, egui::Button::new("Save HDR"))
+                    .add_enabled(can_compare, egui::Button::new("Compare"))
                     .clicked()
                 {
-                    self.save_output();
+                    self.toggle_compare_mode(ctx);
+                }
+
+                let can_histogram = self.preview_texture.is_some();
+                if ui
+                    .add_enabled(can_histogram, egui::Button::new("Histogram"))
+                    .clicked()
+                {
+                    self.show_histogram = !self.show_histogram;
                 }
             });
-
-            let can_compare = self.preview_texture.is_some() && !self.preloaded_images.is_empty();
-            if ui
-                .add_enabled(can_compare, egui::Button::new("Compare"))
-                .clicked()
-            {
-                self.toggle_compare_mode(ctx);
-            }
 
             if self.compare_mode && !self.preloaded_images.is_empty() {
                 ui.horizontal(|ui| {
@@ -1237,7 +1255,85 @@ impl eframe::App for HdrApp {
                     .min(1.0);
                 let scaled_size = egui::vec2(size[0] as f32 * scale, size[1] as f32 * scale);
 
-                ui.add(egui::Image::new(texture).max_size(scaled_size));
+                let (rect, _response) = ui.allocate_exact_size(scaled_size, egui::Sense::hover());
+                ui.painter().image(
+                    texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+
+                // Draw histogram overlay
+                if self.show_histogram {
+                    let hist_height = 100.0;
+                    let hist_width = rect.width();
+                    let hist_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.left(), rect.bottom() - hist_height),
+                        egui::vec2(hist_width, hist_height),
+                    );
+
+                    // Background
+                    ui.painter().rect_filled(
+                        hist_rect,
+                        0.0,
+                        egui::Color32::from_rgba_premultiplied(0, 0, 0, 180),
+                    );
+
+                    let max_count = self.histogram.max_count().max(1) as f32;
+                    let bar_width = hist_width / 256.0;
+                    let log_max = (max_count + 1.0).ln();
+
+                    // Draw RGB histograms overlaid with logarithmic scaling
+                    for i in 0..256 {
+                        let x = hist_rect.left() + i as f32 * bar_width;
+                        let bar_width_adj = bar_width.max(1.0);
+
+                        // Red channel - use log scale and minimum 1px for visibility
+                        if self.histogram.red[i] > 0 {
+                            let red_count = self.histogram.red[i] as f32;
+                            let red_height =
+                                ((red_count + 1.0).ln() / log_max * hist_height).max(1.0);
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(x, hist_rect.bottom() - red_height),
+                                    egui::vec2(bar_width_adj, red_height),
+                                ),
+                                0.0,
+                                egui::Color32::from_rgba_premultiplied(255, 0, 0, 128),
+                            );
+                        }
+
+                        // Green channel
+                        if self.histogram.green[i] > 0 {
+                            let green_count = self.histogram.green[i] as f32;
+                            let green_height =
+                                ((green_count + 1.0).ln() / log_max * hist_height).max(1.0);
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(x, hist_rect.bottom() - green_height),
+                                    egui::vec2(bar_width_adj, green_height),
+                                ),
+                                0.0,
+                                egui::Color32::from_rgba_premultiplied(0, 255, 0, 128),
+                            );
+                        }
+
+                        // Blue channel
+                        if self.histogram.blue[i] > 0 {
+                            let blue_count = self.histogram.blue[i] as f32;
+                            let blue_height =
+                                ((blue_count + 1.0).ln() / log_max * hist_height).max(1.0);
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(x, hist_rect.bottom() - blue_height),
+                                    egui::vec2(bar_width_adj, blue_height),
+                                ),
+                                0.0,
+                                egui::Color32::from_rgba_premultiplied(0, 0, 255, 128),
+                            );
+                        }
+                    }
+                }
             } else {
                 ui.heading("Preview");
                 ui.label("Add images and click 'Create HDR'");
