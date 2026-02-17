@@ -196,7 +196,6 @@ where
     let mut hdr_data: Rgba32FImage = ImageBuffer::new(width, height);
     let total_pixels = height as usize;
     let processed = Arc::new(AtomicUsize::new(0));
-    let last_reported = Arc::new(AtomicUsize::new(0));
     let progress_callback = Arc::new(progress_callback);
 
     let results: Vec<(u32, u32, f32, f32, f32)> = (0..height)
@@ -234,8 +233,8 @@ where
             };
 
             let count = processed.fetch_add(1, Ordering::Relaxed);
-            if count.saturating_sub(last_reported.load(Ordering::Relaxed)) >= total_pixels / 100 {
-                last_reported.store(count, Ordering::Relaxed);
+            let report_interval = (total_pixels / 100).max(1);
+            if count % report_interval == 0 {
                 progress_callback(count);
             }
 

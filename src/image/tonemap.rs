@@ -110,13 +110,10 @@ fn postprocess_pixel(r: f32, g: f32, b: f32, settings: &TonemapSettings) -> Rgb<
 
 fn report_progress(
     count: usize,
-    _processed: &Arc<AtomicUsize>,
-    last_reported: &Arc<AtomicUsize>,
     report_interval: usize,
     progress_callback: &Arc<dyn Fn(usize) + Send + Sync>,
 ) {
-    if count.saturating_sub(last_reported.load(Ordering::Relaxed)) >= report_interval {
-        last_reported.store(count, Ordering::Relaxed);
+    if count % report_interval == 0 {
         progress_callback(count);
     }
 }
@@ -134,7 +131,6 @@ where
 
     let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
     let processed = Arc::new(AtomicUsize::new(0));
-    let last_reported = Arc::new(AtomicUsize::new(0));
     let report_interval = (total_pixels / 100).max(1);
     let progress_callback: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(progress_callback);
 
@@ -162,13 +158,7 @@ where
             let rgb = postprocess_pixel(r, g, b, settings);
 
             let count = processed.fetch_add(1, Ordering::Relaxed);
-            report_progress(
-                count,
-                &processed,
-                &last_reported,
-                report_interval,
-                &progress_callback,
-            );
+            report_progress(count, report_interval, &progress_callback);
 
             (x, y, rgb)
         })
@@ -196,7 +186,6 @@ where
 
     let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
     let processed = Arc::new(AtomicUsize::new(0));
-    let last_reported = Arc::new(AtomicUsize::new(0));
     let report_interval = (total_pixels / 100).max(1);
     let progress_callback: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(progress_callback);
 
@@ -214,13 +203,7 @@ where
             let rgb = postprocess_pixel(r, g, b, settings);
 
             let count = processed.fetch_add(1, Ordering::Relaxed);
-            report_progress(
-                count,
-                &processed,
-                &last_reported,
-                report_interval,
-                &progress_callback,
-            );
+            report_progress(count, report_interval, &progress_callback);
 
             (x, y, rgb)
         })
@@ -249,7 +232,6 @@ where
 
     let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
     let processed = Arc::new(AtomicUsize::new(0));
-    let last_reported = Arc::new(AtomicUsize::new(0));
     let report_interval = (total_pixels / 100).max(1);
     let progress_callback: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(progress_callback);
 
@@ -277,13 +259,7 @@ where
             ]);
 
             let count = processed.fetch_add(1, Ordering::Relaxed);
-            report_progress(
-                count,
-                &processed,
-                &last_reported,
-                report_interval,
-                &progress_callback,
-            );
+            report_progress(count, report_interval, &progress_callback);
 
             (x, y, rgb)
         })
