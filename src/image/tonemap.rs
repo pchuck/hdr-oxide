@@ -1,6 +1,6 @@
 use crate::error::HdrError;
 use crate::image::merge::HdrImage;
-use image::{DynamicImage, ImageBuffer, Rgb, Rgba32FImage};
+use image::{DynamicImage, ImageBuffer, Rgb};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -130,8 +130,7 @@ where
     F: Fn(usize) + Send + Sync + 'static,
 {
     let data = hdr.data.as_ref();
-    let max_lum = calculate_luminance_stats_arc(data, hdr.width, hdr.height).1;
-    let white = max_lum.powi(2);
+    let white = hdr.max_luminance.powi(2);
 
     let total_pixels = (hdr.width as u64 * hdr.height as u64) as usize;
     let processed = Arc::new(AtomicUsize::new(0));
@@ -327,8 +326,7 @@ pub fn tonemap_hdr(
 }
 
 fn tonemap_reinhard(hdr: &HdrImage, settings: &TonemapSettings) -> Result<DynamicImage, HdrError> {
-    let max_lum = calculate_luminance_stats(hdr).1;
-    let white = max_lum.powi(2);
+    let white = hdr.max_luminance.powi(2);
 
     let processed: Vec<(u32, u32, Rgb<u8>)> = (0..hdr.height)
         .into_par_iter()
@@ -610,35 +608,4 @@ fn apply_sharpen_blur(image: &DynamicImage, amount: f32) -> Result<DynamicImage,
     } else {
         Ok(image.clone())
     }
-}
-
-fn calculate_luminance_stats(hdr: &HdrImage) -> (f32, f32) {
-    let data = hdr.data.as_ref();
-    let mut sum_lum = 0.0f32;
-    let mut max_lum = 0.0f32;
-    let pixel_count = (hdr.width as u64 * hdr.height as u64) as f32;
-
-    for pixel in data.pixels() {
-        let lum = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
-        sum_lum += lum;
-        max_lum = max_lum.max(lum);
-    }
-
-    let avg_lum = sum_lum / pixel_count;
-    (avg_lum, max_lum)
-}
-
-fn calculate_luminance_stats_arc(data: &Rgba32FImage, width: u32, height: u32) -> (f32, f32) {
-    let mut sum_lum = 0.0f32;
-    let mut max_lum = 0.0f32;
-    let pixel_count = (width as u64 * height as u64) as f32;
-
-    for pixel in data.pixels() {
-        let lum = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
-        sum_lum += lum;
-        max_lum = max_lum.max(lum);
-    }
-
-    let avg_lum = sum_lum / pixel_count;
-    (avg_lum, max_lum)
 }

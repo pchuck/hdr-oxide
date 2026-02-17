@@ -10,10 +10,12 @@ fn create_test_hdr(width: u32, height: u32, color: [f32; 4]) -> HdrImage {
             data.put_pixel(x, y, Rgba(color));
         }
     }
+    let max_lum = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
     HdrImage {
         data: Arc::new(data),
         width,
         height,
+        max_luminance: max_lum,
     }
 }
 
@@ -111,6 +113,7 @@ fn test_tonemap_sharpen_blur() {
         data: Arc::new(data),
         width: 8,
         height: 8,
+        max_luminance: 1.0,
     };
 
     // Test sharpening

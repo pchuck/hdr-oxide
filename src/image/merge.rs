@@ -9,6 +9,7 @@ pub struct HdrImage {
     pub data: Arc<Rgba32FImage>,
     pub width: u32,
     pub height: u32,
+    pub max_luminance: f32,
 }
 
 impl HdrImage {
@@ -18,11 +19,21 @@ impl HdrImage {
             data: Arc::new(data),
             width,
             height,
+            max_luminance: 0.0,
         }
     }
 
     pub fn from_exr(_path: &std::path::Path) -> std::result::Result<Self, HdrError> {
         Err(HdrError::Exr("EXR reading not yet implemented".to_string()))
+    }
+
+    fn calculate_max_luminance(data: &Rgba32FImage) -> f32 {
+        let mut max_lum = 0.0f32;
+        for pixel in data.pixels() {
+            let lum = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
+            max_lum = max_lum.max(lum);
+        }
+        max_lum
     }
 }
 
@@ -43,10 +54,12 @@ pub fn merge_to_hdr(images: &[SourceImage]) -> std::result::Result<HdrImage, Hdr
             }
         }
 
+        let max_lum = HdrImage::calculate_max_luminance(&rgba);
         return Ok(HdrImage {
             data: Arc::new(rgba),
             width: img.width,
             height: img.height,
+            max_luminance: max_lum,
         });
     }
 
@@ -119,10 +132,12 @@ pub fn merge_to_hdr(images: &[SourceImage]) -> std::result::Result<HdrImage, Hdr
 
     log::info!("HDR merge complete");
 
+    let max_lum = HdrImage::calculate_max_luminance(&hdr_data);
     Ok(HdrImage {
         data: Arc::new(hdr_data),
         width,
         height,
+        max_luminance: max_lum,
     })
 }
 
@@ -236,9 +251,11 @@ where
 
     log::info!("HDR merge complete (parallel)");
 
+    let max_lum = HdrImage::calculate_max_luminance(&hdr_data);
     Ok(HdrImage {
         data: Arc::new(hdr_data),
         width,
         height,
+        max_luminance: max_lum,
     })
 }
